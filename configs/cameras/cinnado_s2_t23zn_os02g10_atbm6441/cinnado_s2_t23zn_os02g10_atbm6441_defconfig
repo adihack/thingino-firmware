@@ -1,0 +1,48 @@
+# NAME: Cinnado S2 (T23ZN, OS02G10, ATBM6441)
+# FRAG: soc-xburst1 core ssl
+#
+# SoC:    Ingenic T23ZN, XBurst1 MIPS32 R1, 64MB RAM (46M+18M split)
+# Sensor: OmniVision OS02G10, 1/2.9" 2MP 2304x1296, I2C0 @0x3c, reg_addr_size=0 (ZRT bank-switch)
+# Flash:  16MB NOR SPI, GigaDevice GD25Q127C (JEDEC c84018 -- NOT ef4017).
+# UART:   ttyS1 @115200.
+#
+# WiFi:   AltoBeam ATBM6441 (SDIO). NOTE: the physical chip is ATBM6441, but this profile runs the
+#   COMPLETE thingino ATBM6461 stack (atbm6461_wifi_sdio.ko + z7682 MCU-watchdog disable + MCU tools).
+#   ATBM6441/6461 share the same Z7682 MCU + librtos command protocol -- VERIFIED by live RE on this
+#   unit: identical opcodes (pir_enable=9, wdt_disable=0x13, battery=0x1a/0x1b) match atbm6461-tool.c.
+#   >>> FIRST-BOOT CHECK: confirm WiFi associates. If the 6461 .ko does not bring up the 6441 radio,
+#   swap in the blob dumped from this unit (extracted/atbm6041_wifi_sdio.ko) -- see
+#   CINNADO_S2_PORT_ANALYSIS.md "WiFi fallback".
+#
+# MCU watchdog: ATBM6441/Z7682 resets the SoC ~14.5s unless disabled; thingino S09mmc calls
+#   /usr/bin/z7682_disable_wdt after loading the driver (handled automatically by wifi-atbm6461).
+#
+# DIFFERENCES vs Cinnado B6 (this profile's parent):
+#  - NO motors: S2 has no pan/tilt (stock user tag ptz=0). B6's motors section removed.
+#  - PIR: S2 HAS a PIR motion sensor, reported by the MCU over /dev/atbm_ioctl (NOT a SoC GPIO).
+#    Arm with `mcu_test --pir_enable` (opcode 9); motion = 576-byte records (type 0x06, byte[0x4e]==1).
+#  - Buttons PWR/RST are MCU power/wake (long-press 5-6s), NOT SoC GPIO -- no thingino handling needed.
+#  - Floodlight = "white" light on GPIO60 (same as B6) -- driven by thingino-daynight `light white`.
+#
+# GPIO (validated live on this exact unit; matches B6 thingino.json):
+#   ircut 58/64, ir940(IR-LED) 62, white(floodlight) 60, led_b 49, led_r 50, speaker 63, mmc_cd 61.
+
+BR2_ISP_CLKA_600MHZ=y
+BR2_ISP_CLKA_SCLKA=y
+BR2_ISP_CLK_200MHZ=y
+BR2_ISP_CLK_SCLKA=y
+BR2_PACKAGE_THINGINO_KOPT_MMC0=y
+BR2_PACKAGE_THINGINO_KOPT_MMC0_PB_4BIT=y
+BR2_PACKAGE_WIFI=y
+BR2_PACKAGE_WIFI_ATBM6461=y
+BR2_PACKAGE_ATBM6461_TOOLS=y
+BR2_PACKAGE_THINGINO_WPA_SUPPLICANT_WEXT=y
+BR2_SENSOR_1_NAME="os02g10"
+BR2_INGENIC_SOC_MODEL="t23zn"
+BR2_THINGINO_AUDIO=y
+BR2_THINGINO_AUDIO_GPIO=63
+BR2_THINGINO_RMEM_MB=18
+BR2_THINGINO_SDCARD=y
+FLASH_SIZE_MB=16
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/cinnado_s2_t23zn_os02g10_atbm6441/cinnado_s2_t23zn.kernel.config"
+BR2_ISP_PRINT_LEVEL_0=y
