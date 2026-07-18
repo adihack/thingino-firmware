@@ -218,3 +218,55 @@ flashrom -p ch341a_spi -c GD25Q127C -w thingino-cinnado_s2_t23zn_os02g10_atbm644
 (Chip is GigaDevice GD25Q127C, JEDEC c84018.) Keep `dump.bin` / `dump_modified.bin` as restore images.
 After flashing, Thingino's U-Boot + kernel print to **ttyS1** — so first boot is fully observable
 over our existing serial. First-boot checklist: §6 (WiFi assoc is risk #1).
+
+---
+
+## 9. LIVE: Thingino U-Boot SELF-FLASHED & running (no desolder!) ✅✅✅ (2026-07-18)
+
+**Self-flashed the built Thingino U-Boot from the running (vendor-Linux) board — no CH341A, no desolder —
+and it boots fully interactive on ttyS1.**
+
+Method (worked): the recovery /bin/sh has `flashcp` + `md5sum` (no dd/mtd_debug/base64). Steps:
+1. Extract first 0x60000 of the full image (U_BOOT 0x0 + UB_ENV 0x50000) → `ube_0x60000.bin` (393216 B, md5 49a72742…).
+2. Transfer to `/tmp/ube.bin` over serial (printf-hex chunks, ~12 min); **verify md5 on-device == local (GATE)**.
+3. `mknod /dev/mtd0 c 90 0` (no mdev in bare initramfs; mtd char major=90), then
+   `flashcp -v /tmp/ube.bin /dev/mtd0` → erases 12×32K blocks, writes 384K, **verifies 100%** (rc=0).
+4. `reboot -f`.
+
+Result on ttyS1:
+```
+T23 TPL / TPL: DDR up / SPL loaded, jumping
+U-Boot SPL 2026.07  →  U-Boot 2026.07 (our build)
+CPU: Ingenic T23 (XBurst1)  Model: ISVP-T23ZN (SFC NOR)  DRAM: 64 MiB
+SF: Detected gd25q128 ... 16 MiB     (flash correct)
+In/Out/Err: serial@10031000          (ttyS1 — interactive)
+Hit any key to stop autoboot         (interruptible — unlike vendor single-stage SPL)
+=> version  → U-Boot 2026.07 ... Buildroot 15.3.0   (responds to commands)
+```
+`printenv` (key vars): `bootcmd=run autoupdate;run loaduenv;sf probe;setenv bootargs …;sf read ${loadaddr}
+${kern_addr} ${kern_size};bootm`; `kern_addr=0x60000 kern_size=0x160000 loadaddr=0x80600000
+flash_len=0x1000000 root=/dev/mtdblock3 rootfstype=squashfs serialport=ttyS1`.
+Autoboot fails with `ERROR -91: can't get kernel image!` — expected, kernel/rootfs are still vendor data
+(only 0x0–0x60000 was flashed). Drops to the `=>` prompt.
+
+### The `autoupdate` mechanism (clean full-install path, from env)
+```
+autoupdate = fatload mmc 0:1 ${loadaddr} autoupdate-full.bin ; sf probe ; sf erase 0 ${flash_len} ;
+             sf write ${loadaddr} 0 ${filesize} ; ... reset
+```
+→ Put the full image on a FAT SD card as **`autoupdate-full.bin`**, insert, and Thingino U-Boot
+auto-flashes the whole 16 MB and reboots. (See watchdog caveat below.)
+
+### MCU-watchdog caveat (why it currently reboot-loops)
+The ATBM6441/Z7682 MCU watchdog resets the SoC ~14 s after boot unless fed/disabled, and **U-Boot cannot
+disable it** (needs the atbm SDIO driver, not in U-Boot). So the `=>` prompt survives only ~14 s per cycle,
+then resets — a harmless loop (it's our U-Boot; the vendor recovery-OTA is gone). This ALSO time-limits any
+U-Boot flash op: a full `sf erase+write` of 16 MB (autoupdate or manual) and a `loady` of the 1.4 MB kernel
+both exceed ~14 s → risky. Once the FULL firmware is flashed, Linux boots (<14 s) and its `S09mmc` runs
+`z7682_disable_wdt` → watchdog off → stable.
+
+### To finish the install (get full Thingino booting)
+- **Reliable:** CH341A full-flash of `thingino-...bin` (board OFF, no watchdog): `flashrom -p ch341a_spi
+  -c GD25Q127C -w thingino-...bin`. (Milestone proves the U-Boot; this completes kernel+rootfs+data.)
+- **Watchdog-limited alternatives:** SD `autoupdate-full.bin`, or U-Boot `loady`+`sf write` — both need the
+  op to finish inside the ~14 s window (tight/risky) unless the MCU watchdog is first extended/disabled.
