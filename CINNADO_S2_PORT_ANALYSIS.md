@@ -171,3 +171,50 @@ self-hosted fork (like duggasco's).
 that match `atbm6461-tool.c`), `logs/mcu_protocol.md`, `logs/STABLE_SHELL_RECIPE.md`,
 `extracted/atbm6041_wifi_sdio.ko` + `extracted/librtos.so` (own-blob fallback),
 `dump.bin` / `dump_modified.bin` (restore images).
+
+---
+
+## 8. BUILD RESULT — SUCCESS ✅ (2026-07-18, autonomous)
+
+The profile **builds cleanly** and produces a valid, bootable 16 MB image.
+
+```
+output/.../images/thingino-cinnado_s2_t23zn_os02g10_atbm6441.bin
+  size = 16777216 (16 MB, padded to flash)
+  first bytes = 06 05 04 03 02 55 aa 55  (valid Ingenic SPL header — same format as stock)
+  sha256 = 048146518442e56b046745b181b704f8b94f5a4ed9166cb7b1eeace9199d5fda
+  built from commit 70b6c8c
+```
+
+**Thingino MTD layout produced for the S2 (16 MB):**
+```
+mtdparts=jz_sfc:320k(boot),64k(env),1408k(kernel),4608k(rootfs),9984k(data),16384k@0(all)
+```
+| part | offset | size | content |
+|---|---|---|---|
+| U_BOOT | 0x000000 | 320K | Thingino U-Boot (interactive, console=ttyS1) |
+| UB_ENV | 0x050000 | 64K  | U-Boot env |
+| KERNEL | 0x060000 | 1408K | uImage (~1.38 MB) |
+| ROOTFS | 0x1C0000 | 4608K | squashfs (RO, ~4.56 MB) |
+| DATA   | 0x640000 | 9984K | jffs2 overlay (writable) |
+
+Artifacts also copied (outside the repo) to `c:/dev/cinnado_s2/thingino_images/`:
+`thingino-...bin` (full), `u-boot-with-tpl-lzma.bin`, `u-boot-env.bin`, `uImage`, `rootfs.squashfs`.
+
+### Host build deps NOT flagged by `make bootstrap` / `dep_check.sh` (add these)
+The stock dep list is incomplete for a clean Ubuntu; the build failed until these were added:
+- **`python3-dev`** — U-Boot 2026.07 `scripts/dtc/pylibfdt` needs `Python.h`.
+- `ripgrep shfmt nodejs npm` — dep_check prompts interactively for these (hangs a non-interactive build).
+- Also installed defensively: `python3-setuptools libssl-dev pkg-config texinfo help2man gettext`.
+- **PATH must not contain spaces** — buildroot aborts if the (WSL-inherited Windows) PATH has
+  `Program Files`. Build with `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`.
+
+### Flashing (do with the board POWERED OFF)
+The stock bootloader is single-stage SPL (no interactive U-Boot on ttyS1), and USB-C data is unwired,
+so **CH341A is the flash path.** Full-image write (also removes the vendor recovery-OTA footgun):
+```
+flashrom -p ch341a_spi -c GD25Q127C -w thingino-cinnado_s2_t23zn_os02g10_atbm6441.bin
+```
+(Chip is GigaDevice GD25Q127C, JEDEC c84018.) Keep `dump.bin` / `dump_modified.bin` as restore images.
+After flashing, Thingino's U-Boot + kernel print to **ttyS1** — so first boot is fully observable
+over our existing serial. First-boot checklist: §6 (WiFi assoc is risk #1).
