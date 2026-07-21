@@ -1,1 +1,4 @@
 serialport=ttyS1
+# WDT_DISABLE=1 makes U-Boot auto-disable the Z7682 MCU watchdog on every boot
+# (board_late_init) for console-less experimental builds. 0/unset = wdt armed.
+WDT_DISABLE=0
