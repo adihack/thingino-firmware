@@ -6,16 +6,16 @@
 # Flash:  16MB NOR SPI, GigaDevice GD25Q127C (JEDEC c84018 -- NOT ef4017).
 # UART:   ttyS1 @115200.
 #
-# WiFi:   AltoBeam ATBM6441 (SDIO). NOTE: the physical chip is ATBM6441, but this profile runs the
-#   COMPLETE thingino ATBM6461 stack (atbm6461_wifi_sdio.ko + z7682 MCU-watchdog disable + MCU tools).
-#   ATBM6441/6461 share the same Z7682 MCU + librtos command protocol -- VERIFIED by live RE on this
-#   unit: identical opcodes (pir_enable=9, wdt_disable=0x13, battery=0x1a/0x1b) match atbm6461-tool.c.
-#   >>> FIRST-BOOT CHECK: confirm WiFi associates. If the 6461 .ko does not bring up the 6441 radio,
-#   swap in the blob dumped from this unit (extracted/atbm6041_wifi_sdio.ko) -- see
-#   CINNADO_S2_PORT_ANALYSIS.md "WiFi fallback".
+# WiFi:   AltoBeam ATBM6441 (SDIO), the physical chip on this board. Driver is built FROM SOURCE
+#   (wifi-atbm6441: gtxaspec/atbm6441 @8cf3606 + our CMD53-survivability patch), producing
+#   atbm6441_wifi_sdio.ko, plus z7682 MCU-watchdog disable + MCU tools (shared with the 6461 stack:
+#   ATBM6441/6461 share the same Z7682 MCU + librtos protocol -- VERIFIED by live RE on this unit:
+#   identical opcodes pir_enable=9, wdt_disable=0x13, battery=0x1a/0x1b). WiFi is controlled via
+#   /dev/atbm_ioctl (WSM/mcu_test), NOT wpa_supplicant/nl80211 -- the firmware runs the MAC on-chip.
+#   (B6/A1 stay on the recovery-extracted wifi-atbm6461 blob; only S2 uses the source build.)
 #
 # MCU watchdog: ATBM6441/Z7682 resets the SoC ~14.5s unless disabled; thingino S09mmc calls
-#   /usr/bin/z7682_disable_wdt after loading the driver (handled automatically by wifi-atbm6461).
+#   /usr/bin/z7682_disable_wdt after loading the driver (handled automatically by wifi-atbm6441).
 #
 # DIFFERENCES vs Cinnado B6 (this profile's parent):
 #  - NO motors: S2 has no pan/tilt (stock user tag ptz=0). B6's motors section removed.
@@ -34,7 +34,7 @@ BR2_ISP_CLK_SCLKA=y
 BR2_PACKAGE_THINGINO_KOPT_MMC0=y
 BR2_PACKAGE_THINGINO_KOPT_MMC0_PB_4BIT=y
 BR2_PACKAGE_WIFI=y
-BR2_PACKAGE_WIFI_ATBM6461=y
+BR2_PACKAGE_WIFI_ATBM6441=y
 BR2_PACKAGE_ATBM6461_TOOLS=y
 BR2_PACKAGE_THINGINO_WPA_SUPPLICANT_WEXT=y
 BR2_SENSOR_1_NAME="os02g10"
