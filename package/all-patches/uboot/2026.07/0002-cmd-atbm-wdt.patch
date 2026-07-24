@@ -9,10 +9,10 @@ index 63da050..3b182cf 100644
 +obj-$(CONFIG_CMD_ATBM) += atbm_wdt.o
 diff --git a/board/ingenic/isvp-t23/atbm_wdt.c b/board/ingenic/isvp-t23/atbm_wdt.c
 new file mode 100755
-index 0000000..775db19
+index 0000000..1111111
 --- /dev/null
 +++ b/board/ingenic/isvp-t23/atbm_wdt.c
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,441 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
@@ -40,6 +40,7 @@ index 0000000..775db19
 +#include <linux/delay.h>
 +#include <linux/types.h>
 +#include <linux/string.h>
++#include <vsprintf.h>
 +#include <asm/io.h>
 +#include <mach/t23.h>
 +#include <atbm_wdt.h>
@@ -310,12 +311,22 @@ index 0000000..775db19
 +#define MCU_WDT_SET_PERIOD 0x14   /* 4-byte LE seconds; THIS starts the countdown-to-reset */
 +#define MCU_WDT_PERIOD_S   12     /* vendor lpmgr uses 12 s (fed every 6 s) */
 +
-+/* best-effort: drain a few RX frames looking for the 0x043A general-cmd confirm. */
-+static void m3_read_confirm(void)
++/*
++ * Drain a few RX frames looking for the 0x043A general-cmd confirm.
++ * Returns the MCU retcode (0 = OK) or -1 if no confirm was seen.
++ *
++ * RX frame layout (from the HIF queue): [len@0][wsm_id@2][wsm_body@4...].
++ * The wsm_body is the general_cmd struct {magic, cmd_id, crc, retcode,
++ * data_len, data[]}, so ABSOLUTE offsets are: magic@4, cmd@8, crc@12,
++ * retcode@16, data_len@20, data@24. (The old code read b[4] as "retcode",
++ * which is actually the magic 0xACACCACA -> that was the bogus reading.)
++ */
++static int m3_read_confirm(void)
 +{
-+	static u8 b[512]; u16 ctrl, id, pb; u32 nl; int f, i; u8 bid = 1;
-+	for (i = 0; i < 500; i++) { ctrl = hif_r16(HIF_CONTROL); if (ctrl & 0xCFFF) break; udelay(1000); }
-+	if (!(ctrl & 0xCFFF)) return;
++	static u8 b[512]; u16 ctrl, id, pb; u32 nl; int f, i, k; u8 bid = 1;
++	/* wait up to ~2s for the MCU to queue a reply frame (it can be slow) */
++	for (i = 0; i < 2000; i++) { ctrl = hif_r16(HIF_CONTROL); if (ctrl & 0xCFFF) break; udelay(1000); }
++	if (!(ctrl & 0xCFFF)) { printf("  atbm: no reply frame (fire-and-forget)\n"); return -1; }
 +	nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
 +	for (f = 0; f < 12; f++) {
 +		u32 alloc;
@@ -330,45 +341,73 @@ index 0000000..775db19
 +		pb = b[alloc-2] | (b[alloc-1] << 8);
 +		nl = ((u32)(pb & 0x0FFF) | ((u32)(pb & 0xC000) >> 2)) * 2;
 +		bid = (bid & 3) + 1;
-+		if (id == 0x043A) { u32 rc = b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24); px("  atbm confirm 0x043A retcode=", rc); return; }
++		if (id == 0x043A) {
++			u32 mg = b[4]  | (b[5]<<8)  | (b[6]<<16)  | (b[7]<<24);
++			u32 cm = b[8]  | (b[9]<<8)  | (b[10]<<16) | (b[11]<<24);
++			s32 rc = (s32)(b[16] | (b[17]<<8) | (b[18]<<16) | (b[19]<<24));
++			printf("  atbm 0x043A raw:");
++			for (k = 0; k < 28; k++) printf(" %02x", b[k]);
++			printf("\n  atbm confirm: magic=0x%08x cmd=0x%x retcode=%d\n", mg, cm, rc);
++			return rc;
++		}
 +	}
++	printf("  atbm: no 0x043A confirm found\n");
++	return -1;
++}
++
++/* Bring MSC1/SDIO up + wake the ATBM into message mode. 0 on success. */
++static int atbm_link_up(void)
++{
++	int e;
++	msc1_clocks_pins();
++	msc1_reset();
++	e = m1_enum();
++	if (e) { printf("atbm: SDIO enum failed (%d)\n", e); return e; }
++	wake_light();
++	return 0;
++}
++
++/*
++ * Fire one raw MCU opcode (+ optional 4-byte LE arg) and report the confirm.
++ * Used by the `atbm mcu` probe command. Each call re-establishes the SDIO
++ * link, so it also acts as a host-alive keepalive "feed".
++ */
++int atbm_mcu_cmd(u8 cmd, u32 arg, int arglen)
++{
++	int rc;
++	if (atbm_link_up()) return -1;
++	m3_frame(cmd, arg, arglen);
++	mdelay(5);
++	rc = m3_read_confirm();
++	printf("atbm: mcu cmd=0x%x arg=0x%x len=%d -> retcode=%d\n", cmd, arg, arglen, rc);
++	return rc;
 +}
 +
 +int atbm_wdt_set(int enable)
 +{
-+	static int last_state = -1;	/* -1 unknown, 0 disabled, 1 enabled */
-+	int e;
++	int rc;
 +
 +	enable = !!enable;
-+	if (enable == last_state) {
-+		printf("atbm: MCU watchdog already %s\n",
-+		       enable ? "enabled" : "disabled");
-+		return 0;
-+	}
-+
-+	msc1_clocks_pins();
-+	msc1_reset();
-+	e = m1_enum();
-+	if (e) { printf("atbm: SDIO enum failed (%d) - MCU wdt NOT changed\n", e); return -1; }
-+	wake_light();
++	/* No last_state cache: every call re-does the SDIO enum + WSM send, so a
++	 * repeated 'atbm wdt off' also serves as a host-alive keepalive feed. */
++	if (atbm_link_up()) { printf("atbm: MCU wdt NOT changed\n"); return -1; }
 +	if (enable) {
-+		/* Enable alone only powers the WDT block; SET_PERIOD is what arms the
-+		 * countdown-to-reset. Mirror the vendor: enable then set_period(12s).
-+		 * Nothing feeds it in U-Boot, so it will reset ~12 s later unless the
-+		 * OS (or a 'wdt off') takes over. */
++		/* Enable alone only powers the WDT block; SET_PERIOD arms the
++		 * countdown-to-reset. Mirror the vendor: enable then set_period. */
 +		m3_frame(MCU_WDT_ENABLE, 0, 0);
 +		mdelay(2);
 +		m3_frame(MCU_WDT_SET_PERIOD, MCU_WDT_PERIOD_S, 4);
 +	} else {
 +		m3_frame(MCU_WDT_DISABLE, 0, 0);
 +	}
-+	m3_read_confirm();
-+	last_state = enable;
-+	if (enable)
-+		printf("atbm: MCU watchdog ENABLED + armed %ds (0x12+0x14) - resets unless fed/OS-managed\n",
-+		       MCU_WDT_PERIOD_S);
-+	else
-+		printf("atbm: MCU watchdog DISABLED (0x13)\n");
++	mdelay(5);
++	rc = m3_read_confirm();
++	printf("atbm: MCU watchdog %s (0x%x) -> retcode=%d %s\n",
++	       enable ? "ENABLE+arm" : "DISABLE",
++	       enable ? MCU_WDT_ENABLE : MCU_WDT_DISABLE, rc,
++	       rc == 0 ? "OK (confirmed)" :
++	       rc > 0  ? "(MCU error code)" :
++	                 "(sent, no confirm - fire-and-forget usually still applies)");
 +	return 0;
 +}
 +
@@ -386,23 +425,34 @@ index 0000000..775db19
 +#if defined(CONFIG_CMD_ATBM)
 +static int do_atbm(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
 +{
-+	int enable;
++	if (argc >= 3 && !strcmp(argv[1], "wdt")) {
++		int enable;
++		if (!strcmp(argv[2], "off") || !strcmp(argv[2], "disable"))
++			enable = 0;
++		else if (!strcmp(argv[2], "on") || !strcmp(argv[2], "enable"))
++			enable = 1;
++		else
++			return CMD_RET_USAGE;
++		return atbm_wdt_set(enable) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++	}
 +
-+	if (argc < 3 || strcmp(argv[1], "wdt"))
-+		return CMD_RET_USAGE;
-+	if (!strcmp(argv[2], "off") || !strcmp(argv[2], "disable"))
-+		enable = 0;
-+	else if (!strcmp(argv[2], "on") || !strcmp(argv[2], "enable"))
-+		enable = 1;
-+	else
-+		return CMD_RET_USAGE;
++	/* atbm mcu <cmd_hex> [arg_hex] : fire any raw MCU opcode + show confirm.
++	 * With arg -> 4-byte LE payload (set_period etc.). For probing host-alive. */
++	if (argc >= 3 && !strcmp(argv[1], "mcu")) {
++		u8 cmd = (u8)simple_strtoul(argv[2], NULL, 16);
++		u32 arg = 0; int arglen = 0;
++		if (argc >= 4) { arg = simple_strtoul(argv[3], NULL, 16); arglen = 4; }
++		atbm_mcu_cmd(cmd, arg, arglen);
++		return CMD_RET_SUCCESS;
++	}
 +
-+	return atbm_wdt_set(enable) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++	return CMD_RET_USAGE;
 +}
 +
-+U_BOOT_CMD(atbm, 3, 0, do_atbm,
++U_BOOT_CMD(atbm, 4, 0, do_atbm,
 +	"ATBM6441 / Z7682 MCU control",
-+	"wdt on|off   - enable(0x12)/disable(0x13) the Z7682 MCU hardware watchdog (SDIO/MSC1)");
++	"wdt on|off        - enable(0x12+0x14)/disable(0x13) the Z7682 MCU watchdog\n"
++	"atbm mcu <c> [a]  - fire raw MCU opcode c (hex) with optional 4B arg a (hex)");
 +#endif /* CONFIG_CMD_ATBM */
 diff --git a/board/ingenic/isvp-t23/isvp-t23.c b/board/ingenic/isvp-t23/isvp-t23.c
 index 233ed88..ae95486 100644
