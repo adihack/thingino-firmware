@@ -1,0 +1,31 @@
+Cinnado S2 T23ZN+ATBM6441: clamp WiFi SDIO (mmc1) to 24MHz + program RESTO for CMD53
+response-timeout margin. Fixes flaky STARTUP_IND read -> MCU-wdt reboot loop.
+
+--- a/drivers/mmc/host/jzmmc_v12.c
++++ b/drivers/mmc/host/jzmmc_v12.c
+@@ -930,6 +930,11 @@
+ 	msc_writel(host, CMD, cmd->opcode);
+ 	msc_writel(host, ARG, cmd->arg);
+ 	msc_writel(host, CMDAT, host->cmdat);
++	/* Cinnado S2 / T23ZN: give the response-timeout counter maximum slack
++	 * (NCR can be up to 64 clocks). jzmmc otherwise leaves RESTO at its reset
++	 * default for data/CMD53 commands, causing premature STAT_TIME_OUT_RES on
++	 * marginal responses. Mirrors what send_stop_command() already does. */
++	msc_writel(host, RESTO, 0xff);
+ 	msc_writel(host, CTRL, CTRL_START_OP);
+ 	if (is_pio_mode(host)) {
+ 		if (wait_cmd_response(host) < 0) {
+@@ -1563,6 +1568,13 @@
+ 	mmc->ops = &jzmmc_ops;
+ 	mmc->f_min = 200000;
+ 	mmc->f_max = pdata->max_freq;
++	/* Cinnado S2 / T23ZN + ATBM6441: the SDIO CMD53 command-response phase is
++	 * timing-marginal above ~40MHz on this board, which intermittently returns
++	 * STAT_TIME_OUT_RES and fails the WSM STARTUP_IND read, bricking WiFi
++	 * bring-up (MCU-watchdog reboot loop). Clamp the non-removable (MANUAL)
++	 * WiFi host to a reliable 24MHz. */
++	if (pdata->removal == MANUAL && mmc->f_max > 24000000)
++		mmc->f_max = 24000000;
+ 	mmc->ocr_avail = pdata->ocr_avail;
+ 	mmc->caps |= pdata->capacity;
+ 	mmc->caps2 |= MMC_CAP2_NO_PRESCAN_POWERUP;

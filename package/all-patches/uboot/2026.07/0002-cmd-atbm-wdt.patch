@@ -1,0 +1,522 @@
+diff --git a/board/ingenic/isvp-t23/Makefile b/board/ingenic/isvp-t23/Makefile
+index 63da050..3b182cf 100644
+--- a/board/ingenic/isvp-t23/Makefile
++++ b/board/ingenic/isvp-t23/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0+
+ 
+ obj-y := isvp-t23.o
++obj-$(CONFIG_CMD_ATBM) += atbm_wdt.o
+diff --git a/board/ingenic/isvp-t23/atbm_wdt.c b/board/ingenic/isvp-t23/atbm_wdt.c
+new file mode 100755
+index 0000000..775db19
+--- /dev/null
++++ b/board/ingenic/isvp-t23/atbm_wdt.c
+@@ -0,0 +1,391 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
++ *
++ * Register logic ported verbatim from the HW-proven bare-metal blob
++ * (scratchpad/ubootblob/blob.c, cold-boot PASS 2026-07-21). The two only
++ * behavioural substitutions vs the blob are: U-Boot udelay()/mdelay() instead
++ * of the CP0-Count delay, and printf() instead of the raw UART1 pokes.
++ *
++ * There is ZERO conflict with U-Boot's MMC/clk/pinctrl DM: on T23 U-Boot has
++ * no MSC1 node, no MSC1 clock-table entry and no mmc1 pin group, so nothing
++ * else touches MSC1 (0xb3460000), CPM CLKGR0 bit5 / MSC1CDR(0xa4), or the
++ * port-B pins PB8-14. The raw-register bring-up below owns them exclusively.
++ *
++ * Mechanism: the ATBM HERA firmware self-boots from on-chip ROM and is already
++ * streaming WSM TRACE frames at U-Boot time. The WSM credit-gate (STARTUP_IND)
++ * is host-side bookkeeping only, not a wire requirement, so a fire-and-forget
++ * block-write of the command frame to the force-bit input-queue address (0x28)
++ * is accepted by the running firmware, which relays the opcode to the Z7682
++ * MCU.  cmd 0x13 = disable watchdog, cmd 0x12 = enable/re-arm.
++ */
++
++#include <command.h>
++#include <stdio.h>
++#include <linux/delay.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <asm/io.h>
++#include <mach/t23.h>
++#include <atbm_wdt.h>
++
++/* ---- raw 32-bit MMIO (KSEG1 uncached; addresses are already 0xb...) ---- */
++static inline u32 rd(u32 a) { return readl((void __iomem *)(uintptr_t)a); }
++static inline void wr(u32 a, u32 v) { writel(v, (void __iomem *)(uintptr_t)a); }
++
++/* ---- MSC1 controller (0xb3460000, from mach/t23.h) ---- */
++#define MSC1            MSC1_BASE
++#define MR(o)           rd(MSC1 + (o))
++#define MW(o, v)        wr(MSC1 + (o), (v))
++#define MSC_CTRL        0x00
++#define MSC_STAT        0x04
++#define MSC_CLKRT       0x08
++#define MSC_CMDAT       0x0C
++#define MSC_RESTO       0x10
++#define MSC_RDTO        0x14
++#define MSC_BLKLEN      0x18
++#define MSC_NOB         0x1C
++#define MSC_IMASK       0x24
++#define MSC_IFLG        0x28
++#define MSC_CMD         0x2C
++#define MSC_ARG         0x30
++#define MSC_RES         0x34
++#define MSC_RXFIFO      0x38
++#define MSC_TXFIFO      0x3C
++#define MSC_DMAC        0x44
++#define CTRL_CLOCK_START 0x2
++#define CTRL_START_OP   (1 << 2)
++#define CTRL_RESET      (1 << 3)
++#define ST_RESETTING    (1 << 15)
++#define ST_END_CMD_RES  (1 << 11)
++#define ST_DATA_TRAN_DONE (1 << 12)
++#define ST_PRG_DONE     (1 << 13)
++#define ST_CRC_RD_ERR   (1 << 4)
++#define ST_CRC_WR_ERR   (1 << 2)
++#define ST_TIMEOUT_RES  (1 << 1)
++#define ST_FIFO_EMPTY   (1 << 6)
++#define ST_FIFO_FULL    (1 << 7)
++#define DA_BUSY         (1 << 6)
++#define DA_DATA_EN      (1 << 3)
++#define DA_WRITE        (1 << 4)
++#define DA_4BIT         (2 << 9)
++#define RSP_NONE        0
++#define RSP_R1          1
++#define RSP_R3          3
++#define RSP_R6          6
++#define RSP_R5          5
++
++/* ---- CPM / GPIO (mach/t23.h: CPM_BASE 0xb0000000, GPIO_BASE 0xb0010000) ---- */
++#define GPIOB           (GPIO_BASE + 0x1000)   /* 0xb0011000 */
++#define MSC1_PINS       0x6F00u                /* PB8-14 -> MSC1 device fn0 */
++
++static void msc1_clocks_pins(void)
++{
++	/* ungate MSC1 (CLKGR0 bit5); set MSC1 clock divider (24 MHz) */
++	wr(CPM_BASE + CPM_CLKGR0, rd(CPM_BASE + CPM_CLKGR0) & ~CPM_CLKGR0_MSC1);
++	wr(CPM_BASE + CPM_MSC1CDR, 0x18 | MSCCDR_CE);
++	{ int i; for (i = 0; i < 100000 && (rd(CPM_BASE + CPM_MSC1CDR) & MSCCDR_BUSY); i++); }
++	wr(CPM_BASE + CPM_MSC1CDR, 0x18);
++	/* mux PB8-14 to MSC1: INTC/MASKC/PAT1C clear, PAT0S set */
++	wr(GPIOB + 0x18, MSC1_PINS);
++	wr(GPIOB + 0x28, MSC1_PINS);
++	wr(GPIOB + 0x38, MSC1_PINS);
++	wr(GPIOB + 0x44, MSC1_PINS);
++}
++
++static void msc1_reset(void)
++{
++	MW(MSC_CTRL, CTRL_RESET); MW(MSC_CTRL, 0);
++	{ int i; for (i = 0; i < 100000 && (MR(MSC_STAT) & ST_RESETTING); i++); }
++	MW(MSC_CTRL, CTRL_CLOCK_START);
++	MW(MSC_IMASK, 0xffffffff); MW(MSC_IFLG, 0xffffffff);
++	MW(MSC_RDTO, 0xffffff); MW(MSC_DMAC, 0); MW(MSC_RESTO, 0xff); MW(MSC_CLKRT, 6);
++}
++
++static int msc1_cmd(u8 op, u32 arg, u32 rt, u32 *resp)
++{
++	int i; u32 s;
++	MW(MSC_CMD, op); MW(MSC_ARG, arg); MW(MSC_CMDAT, rt); MW(MSC_RESTO, 0xff);
++	MW(MSC_CTRL, CTRL_START_OP);
++	for (i = 0; i < 2000000; i++) {
++		s = MR(MSC_STAT);
++		if (rt == RSP_NONE) break;
++		if (s & ST_TIMEOUT_RES) return -1;
++		if (s & ST_END_CMD_RES) break;
++	}
++	MW(MSC_IFLG, ST_END_CMD_RES);
++	if (resp && rt != RSP_NONE) {
++		u32 a = MR(MSC_RES) & 0xffff, b = MR(MSC_RES) & 0xffff, c = MR(MSC_RES) & 0xffff;
++		*resp = (a << 24) | (b << 8) | (c & 0xff);
++	}
++	return 0;
++}
++
++static int cmd52(int wrf, int func, u32 addr, u8 in, u8 *out)
++{
++	u32 arg = ((u32)(wrf & 1) << 31) | ((u32)(func & 7) << 28) |
++		  ((addr & 0x1FFFF) << 9) | (wrf ? in : 0);
++	u32 r = 0;
++	int e = msc1_cmd(52, arg, RSP_R5, &r);
++	if (out) *out = (u8)(r & 0xff);
++	return e;
++}
++
++/* CMD53 BLOCK-mode func1 R/W, 256B blocks, len must be a multiple of 256. PIO. */
++static int cmd53_block(int wrf, u32 addr, u8 *buf, int len)
++{
++	int i, w, words = len / 4, nblk = len / 256; u32 s;
++	u32 arg = ((u32)(wrf & 1) << 31) | (1u << 28) | (1u << 27) | (1u << 26) |
++		  ((addr & 0x1FFFF) << 9) | ((u32)nblk & 0x1FF);
++	u32 cmdat = RSP_R5 | DA_4BIT | DA_DATA_EN | (wrf ? DA_WRITE : 0);
++	MW(MSC_BLKLEN, 256); MW(MSC_NOB, nblk); MW(MSC_RDTO, 0xffffff);
++	MW(MSC_CMD, 53); MW(MSC_ARG, arg); MW(MSC_CMDAT, cmdat); MW(MSC_RESTO, 0xff);
++	MW(MSC_CTRL, CTRL_START_OP);
++	for (i = 0; i < 2000000; i++) { s = MR(MSC_STAT); if (s & ST_TIMEOUT_RES) return -1; if (s & ST_END_CMD_RES) break; }
++	MW(MSC_IFLG, ST_END_CMD_RES);
++	if (wrf) {
++		for (w = 0; w < words; w++) {
++			u32 v = buf[w*4] | (buf[w*4+1] << 8) | (buf[w*4+2] << 16) | (buf[w*4+3] << 24);
++			for (i = 0; i < 1000000 && (MR(MSC_STAT) & ST_FIFO_FULL); i++);
++			MW(MSC_TXFIFO, v);
++		}
++	} else {
++		for (w = 0; w < words; w++) {
++			u32 v;
++			for (i = 0; i < 1000000 && (MR(MSC_STAT) & ST_FIFO_EMPTY); i++);
++			v = MR(MSC_RXFIFO);
++			buf[w*4] = v & 0xff; buf[w*4+1] = (v >> 8) & 0xff; buf[w*4+2] = (v >> 16) & 0xff; buf[w*4+3] = (v >> 24) & 0xff;
++		}
++	}
++	for (i = 0; i < 2000000; i++) { s = MR(MSC_STAT); if (s & (ST_DATA_TRAN_DONE | ST_PRG_DONE)) break; }
++	MW(MSC_IFLG, ST_DATA_TRAN_DONE | ST_PRG_DONE);
++	return (s & (ST_CRC_RD_ERR | ST_CRC_WR_ERR)) ? -2 : 0;
++}
++
++/* CMD53 byte-mode func1 R/W, incrementing addr, len bytes (<=512). PIO. */
++static int cmd53(int wrf, u32 addr, u8 *buf, int len)
++{
++	int i, w, words = (len + 3) / 4; u32 s;
++	u32 arg = ((u32)(wrf & 1) << 31) | (1u << 28) | (0u << 27) | (1u << 26) |
++		  ((addr & 0x1FFFF) << 9) | ((u32)len & 0x1FF);
++	u32 cmdat = RSP_R5 | DA_4BIT | DA_DATA_EN | (wrf ? DA_WRITE : 0);
++	MW(MSC_BLKLEN, len); MW(MSC_NOB, 1); MW(MSC_RDTO, 0xffffff);
++	MW(MSC_CMD, 53); MW(MSC_ARG, arg); MW(MSC_CMDAT, cmdat); MW(MSC_RESTO, 0xff);
++	MW(MSC_CTRL, CTRL_START_OP);
++	for (i = 0; i < 2000000; i++) { s = MR(MSC_STAT); if (s & ST_TIMEOUT_RES) return -1; if (s & ST_END_CMD_RES) break; }
++	MW(MSC_IFLG, ST_END_CMD_RES);
++	if (wrf) {
++		for (w = 0; w < words; w++) {
++			u32 v = buf[w*4] | (buf[w*4+1] << 8) | (buf[w*4+2] << 16) | (buf[w*4+3] << 24);
++			for (i = 0; i < 1000000 && (MR(MSC_STAT) & ST_FIFO_FULL); i++);
++			MW(MSC_TXFIFO, v);
++		}
++	} else {
++		for (w = 0; w < words; w++) {
++			u32 v;
++			for (i = 0; i < 1000000 && (MR(MSC_STAT) & ST_FIFO_EMPTY); i++);
++			v = MR(MSC_RXFIFO);
++			buf[w*4] = v & 0xff; buf[w*4+1] = (v >> 8) & 0xff; buf[w*4+2] = (v >> 16) & 0xff; buf[w*4+3] = (v >> 24) & 0xff;
++		}
++	}
++	for (i = 0; i < 1000000; i++) { s = MR(MSC_STAT); if (s & (ST_DATA_TRAN_DONE | ST_PRG_DONE)) break; }
++	MW(MSC_IFLG, ST_DATA_TRAN_DONE | ST_PRG_DONE);
++	if (s & (ST_CRC_RD_ERR | ST_CRC_WR_ERR)) return -2;
++	return 0;
++}
++
++/* ---- HIF register file (func1, addr = reg << 2) ---- */
++#define HIF_CONFIG      0x00
++#define HIF_CONTROL     0x04
++#define HIF_QUEUE       0x08
++#define HIF_QUEUE_FORCE 0x28u   /* (buf_id0<<6)|(force1<<5)|reg0x08 : injection TX addr */
++#define HIF_AHB_DPORT   0x0C
++#define HIF_SRAM_BASE   0x10
++#define CFG_ACCESS_MODE (1u << 10)
++#define CFG_CPU_RESET   (1u << 14)
++#define CTL_WUP         (1u << 12)
++
++static u32 hif_r32(u32 a)
++{
++	u8 b[4] = {0, 0, 0, 0};
++	cmd53(0, a, b, 4);
++	return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
++}
++static void hif_w32(u32 a, u32 v)
++{
++	u8 b[4];
++	b[0] = v & 0xff; b[1] = (v >> 8) & 0xff; b[2] = (v >> 16) & 0xff; b[3] = (v >> 24) & 0xff;
++	cmd53(1, a, b, 4);
++}
++static u16 hif_r16(u32 a)
++{
++	u8 b[2] = {0, 0};
++	cmd53(0, a, b, 2);
++	return b[0] | (b[1] << 8);
++}
++static void hif_w16(u32 a, u16 v)
++{
++	u8 b[2];
++	b[0] = v & 0xff; b[1] = (v >> 8) & 0xff;
++	cmd53(1, a, b, 2);
++}
++
++static void px(const char *t, u32 v) { printf("%s0x%08x\n", t, v); }
++
++static int m1_enum(void)
++{
++	u32 r = 0; u16 rca = 0; int i; u8 v = 0;
++	msc1_cmd(0, 0, RSP_NONE, 0); mdelay(2);
++	msc1_cmd(5, 0, RSP_R3, &r);
++	for (i = 0; i < 50; i++) { msc1_cmd(5, r & 0x00300000, RSP_R3, &r); if (r & 0x80000000) break; mdelay(1); }
++	if (!(r & 0x80000000)) { printf("atbm: OCR not ready\n"); return -1; }
++	msc1_cmd(3, 0, RSP_R6, &r); rca = (u16)(r >> 16);
++	msc1_cmd(7, (u32)rca << 16, RSP_R1 | DA_BUSY, &r);
++	MW(MSC_CLKRT, 0);
++	cmd52(0, 0, 0x00, 0, &v);              /* CCCR rev */
++	cmd52(1, 0, 0x07, 0x02, 0);            /* bus width 4-bit */
++	cmd52(1, 0, 0x02, 0x02, 0);            /* IOE func1 */
++	for (i = 0; i < 50; i++) { cmd52(0, 0, 0x03, 0, &v); if (v & 0x02) break; mdelay(1); }
++	cmd52(1, 0, 0x04, 0x03, 0);            /* enable func1 IRQ */
++	cmd52(1, 0, 0x110, 0x00, 0);           /* FBR func1 block size = 256 */
++	cmd52(1, 0, 0x111, 0x01, 0);
++	return (v & 0x02) ? 0 : -2;
++}
++
++/* light wake: only ensure WUP set + message mode (ACCESS_MODE=0). No CPU_RESET. */
++static void wake_light(void)
++{
++	u32 v; u16 c; int i;
++	c = hif_r16(HIF_CONTROL);
++	if (!(c & CTL_WUP)) { c |= CTL_WUP; hif_w16(HIF_CONTROL, c); mdelay(2); }
++	for (i = 0; i < 500 && !(hif_r16(HIF_CONTROL) & 0x2000); i++) udelay(1000); /* CONT_RDY */
++	c = hif_r16(HIF_CONTROL); px("  atbm CONTROL=", c);
++	v = hif_r32(HIF_CONFIG);
++	if (v & CFG_ACCESS_MODE) { v &= ~CFG_ACCESS_MODE; hif_w32(HIF_CONFIG, v); }
++	px("  atbm CONFIG=", hif_r32(HIF_CONFIG));
++}
++
++/*
++ * Build + inject one WSM general-command frame carrying an MCU opcode.
++ *   cmd            = MCU opcode (0x12 enable / 0x13 disable / 0x14 set_period / 0x15 feed)
++ *   payload_word   = little-endian 4-byte argument (only for opcodes that take one)
++ *   payload_len    = argument length in bytes (0 for enable/disable/feed, 4 for set_period)
++ * Frame layout: flag@0, len@4, id@6, magic@8, cmd@12, crc@16, retcode@20,
++ *               payload_len@24, data[512]@28.
++ */
++static void m3_frame(u8 cmd, u32 payload_word, int payload_len)
++{
++	static u8 f[768];
++	volatile u32 *fw = (volatile u32 *)f;
++	int i;
++	for (i = 0; i < 192; i++) fw[i] = 0;
++	fw[0] = 0x1E00021Cu;   /* flag: len(0x021C) low16 + carry-checksum 0x1E high byte */
++	fw[1] = 0x003A021Cu;   /* len=0x021C @4, WSM id=0x003A @6 */
++	fw[2] = 0xACACCACAu;   /* vendor magic @8 */
++	fw[3] = (u32)cmd;      /* MCU cmd @12 */
++	fw[4] = 0xFFFFFFFFu;   /* crc @16 */
++	fw[6] = (u32)payload_len;             /* payload_len @24 */
++	if (payload_len) fw[7] = payload_word; /* data @28 (LE arg) */
++	cmd53_block(1, HIF_QUEUE_FORCE, f, 768);   /* force-bit inject: FW accepts regardless of seq */
++}
++
++/* MCU watchdog opcodes (from mcu_test/lpmgr reverse). */
++#define MCU_WDT_ENABLE     0x12   /* no arg; enables the WDT block (does NOT set the period) */
++#define MCU_WDT_DISABLE    0x13   /* no arg */
++#define MCU_WDT_SET_PERIOD 0x14   /* 4-byte LE seconds; THIS starts the countdown-to-reset */
++#define MCU_WDT_PERIOD_S   12     /* vendor lpmgr uses 12 s (fed every 6 s) */
++
++/* best-effort: drain a few RX frames looking for the 0x043A general-cmd confirm. */
++static void m3_read_confirm(void)
++{
++	static u8 b[512]; u16 ctrl, id, pb; u32 nl; int f, i; u8 bid = 1;
++	for (i = 0; i < 500; i++) { ctrl = hif_r16(HIF_CONTROL); if (ctrl & 0xCFFF) break; udelay(1000); }
++	if (!(ctrl & 0xCFFF)) return;
++	nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
++	for (f = 0; f < 12; f++) {
++		u32 alloc;
++		if (!nl) {
++			for (i = 0; i < 200; i++) { ctrl = hif_r16(HIF_CONTROL); if (ctrl & 0xCFFF) break; udelay(1000); }
++			nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
++			if (!nl) break;
++		}
++		alloc = (nl + 2 + 255) & ~255u; if (alloc > 512) alloc = 512;
++		cmd53_block(0, ((u32)bid << 6) | HIF_QUEUE, b, alloc);
++		id = (b[2] | (b[3] << 8)) & 0x0FFF;
++		pb = b[alloc-2] | (b[alloc-1] << 8);
++		nl = ((u32)(pb & 0x0FFF) | ((u32)(pb & 0xC000) >> 2)) * 2;
++		bid = (bid & 3) + 1;
++		if (id == 0x043A) { u32 rc = b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24); px("  atbm confirm 0x043A retcode=", rc); return; }
++	}
++}
++
++int atbm_wdt_set(int enable)
++{
++	static int last_state = -1;	/* -1 unknown, 0 disabled, 1 enabled */
++	int e;
++
++	enable = !!enable;
++	if (enable == last_state) {
++		printf("atbm: MCU watchdog already %s\n",
++		       enable ? "enabled" : "disabled");
++		return 0;
++	}
++
++	msc1_clocks_pins();
++	msc1_reset();
++	e = m1_enum();
++	if (e) { printf("atbm: SDIO enum failed (%d) - MCU wdt NOT changed\n", e); return -1; }
++	wake_light();
++	if (enable) {
++		/* Enable alone only powers the WDT block; SET_PERIOD is what arms the
++		 * countdown-to-reset. Mirror the vendor: enable then set_period(12s).
++		 * Nothing feeds it in U-Boot, so it will reset ~12 s later unless the
++		 * OS (or a 'wdt off') takes over. */
++		m3_frame(MCU_WDT_ENABLE, 0, 0);
++		mdelay(2);
++		m3_frame(MCU_WDT_SET_PERIOD, MCU_WDT_PERIOD_S, 4);
++	} else {
++		m3_frame(MCU_WDT_DISABLE, 0, 0);
++	}
++	m3_read_confirm();
++	last_state = enable;
++	if (enable)
++		printf("atbm: MCU watchdog ENABLED + armed %ds (0x12+0x14) - resets unless fed/OS-managed\n",
++		       MCU_WDT_PERIOD_S);
++	else
++		printf("atbm: MCU watchdog DISABLED (0x13)\n");
++	return 0;
++}
++
++/*
++ * Called from main_loop() right before the interactive CLI is entered
++ * (autoboot interrupted, or bootcmd returned). Kill the MCU watchdog so the
++ * ~14.5 s reset cannot fire while the operator works at the U-Boot prompt.
++ */
++void atbm_wdt_console_entry(void)
++{
++	printf("atbm: entering U-Boot console -> disabling Z7682 MCU watchdog\n");
++	atbm_wdt_set(0);
++}
++
++#if defined(CONFIG_CMD_ATBM)
++static int do_atbm(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	int enable;
++
++	if (argc < 3 || strcmp(argv[1], "wdt"))
++		return CMD_RET_USAGE;
++	if (!strcmp(argv[2], "off") || !strcmp(argv[2], "disable"))
++		enable = 0;
++	else if (!strcmp(argv[2], "on") || !strcmp(argv[2], "enable"))
++		enable = 1;
++	else
++		return CMD_RET_USAGE;
++
++	return atbm_wdt_set(enable) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(atbm, 3, 0, do_atbm,
++	"ATBM6441 / Z7682 MCU control",
++	"wdt on|off   - enable(0x12)/disable(0x13) the Z7682 MCU hardware watchdog (SDIO/MSC1)");
++#endif /* CONFIG_CMD_ATBM */
+diff --git a/board/ingenic/isvp-t23/isvp-t23.c b/board/ingenic/isvp-t23/isvp-t23.c
+index 233ed88..ae95486 100644
+--- a/board/ingenic/isvp-t23/isvp-t23.c
++++ b/board/ingenic/isvp-t23/isvp-t23.c
+@@ -17,6 +17,8 @@
+ #include <stdio.h>
+ #include <asm/global_data.h>
+ #include <mach/t23.h>
++#include <env.h>
++#include <atbm_wdt.h>
+ 
+ #if defined(CONFIG_USB) || defined(CONFIG_USB_GADGET)
+ #include <dm/ofnode.h>
+@@ -174,3 +176,22 @@ int checkboard(void)
+ {
+ 	return 0;
+ }
++
++#if IS_ENABLED(CONFIG_BOARD_LATE_INIT)
++int board_late_init(void)
++{
++#if IS_ENABLED(CONFIG_CMD_ATBM)
++	/*
++	 * Persistent escape hatch for console-less experimental builds:
++	 *   setenv WDT_DISABLE 1 ; saveenv
++	 * silences the Z7682 MCU watchdog on every boot before the ~14.5 s
++	 * reset window. Unset or 0 leaves the watchdog armed (normal).
++	 */
++	if (env_get_yesno("WDT_DISABLE") == 1) {
++		printf("atbm: WDT_DISABLE=1 -> disabling Z7682 MCU watchdog\n");
++		atbm_wdt_set(0);
++	}
++#endif
++	return 0;
++}
++#endif
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index a527b21..1033d5e 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1299,6 +1299,16 @@ config CMD_FUSE_WRITEBUFF
+ 	  the device, using a structured buffer in memory. The command
+ 	  uses the fuse_writebuff() API.
+ 
++config CMD_ATBM
++	bool "atbm - ATBM6441/Z7682 MCU control (watchdog)"
++	help
++	  Control the on-package Z7682 MCU over SDIO/WSM (MSC1 controller).
++	  "atbm wdt off" disables the MCU hardware watchdog (opcode 0x13),
++	  "atbm wdt on" re-arms it (0x12). Without a disable the board resets
++	  ~14.5 s after boot. Also enables auto-disable when U-Boot drops to
++	  the interactive console (autoboot interrupted) and via the
++	  WDT_DISABLE env flag in board_late_init().
++
+ config CMD_GPIO
+ 	bool "gpio"
+ 	help
+diff --git a/common/main.c b/common/main.c
+index 4b45045..c2b8180 100644
+--- a/common/main.c
++++ b/common/main.c
+@@ -13,6 +13,7 @@
+ #include <cli.h>
+ #include <command.h>
+ #include <console.h>
++#include <atbm_wdt.h>
+ #include <env.h>
+ #include <fdtdec.h>
+ #include <init.h>
+@@ -83,6 +84,9 @@ void main_loop(void)
+ 		panic("Failed to boot");
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_CMD_ATBM))
++		atbm_wdt_console_entry();
++
+ 	cli_loop();
+ 
+ 	panic("No CLI available");
+diff --git a/include/atbm_wdt.h b/include/atbm_wdt.h
+new file mode 100755
+index 0000000..3b62866
+--- /dev/null
++++ b/include/atbm_wdt.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * ATBM6441 / Z7682 MCU hardware-watchdog control from U-Boot.
++ *
++ * Brings up MSC1 SDIO, enumerates the ATBM6441 SDIO func1, light-wakes the
++ * resident HERA WiFi firmware (self-booted from ROM, already alive at U-Boot
++ * time) and injects one WSM general-command (id 0x003A) carrying the MCU
++ * opcode that enables (0x12) or disables (0x13) the on-package Z7682
++ * hardware watchdog. Without a disable, the board resets ~14.5 s after boot.
++ *
++ * HW-proven on a cold boot 2026-07-21 (board survived >20 s after inject).
++ */
++#ifndef __ISVP_T23_ATBM_WDT_H__
++#define __ISVP_T23_ATBM_WDT_H__
++
++/*
++ * enable != 0 -> MCU opcode 0x12 (re-arm watchdog)
++ * enable == 0 -> MCU opcode 0x13 (disable watchdog)
++ * Returns 0 on success (SDIO enumerated + command injected), < 0 on failure.
++ * Prints one clear status line on success and on failure. Skips a redundant
++ * inject if the watchdog is already in the requested state.
++ */
++int atbm_wdt_set(int enable);
++
++/*
++ * Convenience hook for main_loop(): logs a context line and disables the MCU
++ * watchdog when U-Boot drops to the interactive console (autoboot interrupted).
++ */
++void atbm_wdt_console_entry(void);
++
++#endif /* __ISVP_T23_ATBM_WDT_H__ */

@@ -1,0 +1,236 @@
+From: Adrian Soltys <adrian.soltys@seelso.net>
+Subject: [PATCH] atbm6441: Cinnado S2 / T23ZN compat (CMD53 survival + Z7682 MCU bridge)
+
+Two board-specific fixes for running the gtxaspec/atbm6441 driver on the
+Cinnado S2 (Ingenic T23ZN + ATBM6441 "Hera" SDIO WiFi with an on-package
+Z7682 MCU).
+
+== Part 1: survive a transient CMD53 during WSM startup (reboot-loop fix) ==
+hwio_sdio.c, apollo_sdio.c
+
+A single marginal SDIO CMD53 carrying WSM STARTUP_IND was intermittently
+timed out by the jzmmc PIO path; two driver amplifiers turned that into a
+hard reboot loop:
+  * atbm_data_{read,write}_unlock retried with mdelay(1000)*MAX_RETRY(=10),
+    blocking ~10s in one transfer (overshooting the ~14.5s Z7682 watchdog
+    before firmwareReady). Abort the FSM and back off in ms, not seconds.
+  * atbm_sdio_irq_period ignored the ctrl-reg read return code, silently
+    dropping a pending one-shot STARTUP_IND. The RX poll hook is armed from
+    cycle 0 and gated on firmwareReady so the first post-startup confirm is
+    delivered on hosts that do not keep the SDIO card IRQ enabled per-frame.
+Pairs with the jzmmc 24 MHz + RESTO patch (all-patches/linux).
+
+== Part 2: Z7682 MCU general-command bridge ==
+atbm_ioctl.c, atbm_ioctl_ext.h, wsm.c, wsm.h
+
+The vendor userspace (librtos.so / mcu_test / z7682_disable_wdt) drives the
+Z7682 MCU -- watchdog-disable (cmd 0x13), PIR, battery, floodlight -- via
+ioctl _IOW(121,70) carrying a 532-byte {magic 0xACACCACA, cmd, crc32,
+retcode, payload_len, data[512]} packet. The upstream gtxaspec driver has no
+handler, so every such call hit the switch default and returned -1
+("ioctl ATBM_GENERAL_CMD error"), leaving the MCU watchdog armed -> reset.
+This adds atbm_wsm_send_general_cmd() to forward that packet to the MCU as
+WSM general command 0x003A and match its 0x043A confirm. Without it the
+Cinnado S2 reboot-loops (watchdog never disabled) and all MCU peripheral
+control is dead.
+
+Signed-off-by: Adrian Soltys <adrian.soltys@seelso.net>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+--- a/hal_apollo/hwio_sdio.c	2026-07-20 14:07:22.522155240 +0200
++++ b/hal_apollo/hwio_sdio.c	2026-07-20 14:07:22.532856915 +0200
+@@ -282,8 +282,13 @@
+ 			hw_priv->buf_id_rx = buf_id_rx;
+ 			break;
+ 		} else {
++			/* Cinnado S2/T23ZN: recover a transient CMD53 failure in ms, not
++			 * seconds. The old mdelay(1000)*MAX_RETRY(=10) could block ~10s in
++			 * one read and blow the ~14.5s MCU-watchdog during WSM startup.
++			 * Abort to reset the SDIO FSM, then back off briefly (1..N ms). */
++			WARN_ON(hw_priv->sbus_ops->abort(hw_priv->sbus_priv));
+ 			retry++;
+-			mdelay(1000);
++			mdelay(retry);
+ 			atbm_dbg(ATBM_APOLLO_DBG_ERROR, "%s,error :[%d]\n",
+ 					__func__, ret);
+ 		}
+@@ -355,8 +360,10 @@
+ 			hw_priv->buf_id_tx = buf_id_tx;
+ 			break;
+ 		} else {
++			/* Cinnado S2/T23ZN: fast CMD53 retry (see atbm_data_read_unlock). */
++			WARN_ON(hw_priv->sbus_ops->abort(hw_priv->sbus_priv));
+ 			retry++;
+-			mdelay(1000);
++			mdelay(retry);
+ 			atbm_dbg(ATBM_APOLLO_DBG_ERROR, "%s,%d,error :[%d]\n",
+ 					__func__, __LINE__, ret);
+ 		}
+--- a/hal_apollo/apollo_sdio.c	2026-07-20 14:07:22.538495747 +0200
++++ b/hal_apollo/apollo_sdio.c	2026-07-20 14:07:22.548553163 +0200
+@@ -306,8 +306,11 @@
+ 		ret = 1;
+ 		goto exit;
+ 	}
+-	atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg);	
+-	if(ctrl_reg & ATBM_HIFREG_CONT_NEXT_LEN_MASK){
++	/* Cinnado S2/T23ZN: if the ctrl-reg CMD53 itself errored, ctrl_reg stays 0
++	 * and a pending one-shot STARTUP_IND would be silently dropped. Force the RX
++	 * path to run on read error too, not only when NEXT_LEN is set. */
++	if(atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg) ||
++		(ctrl_reg & ATBM_HIFREG_CONT_NEXT_LEN_MASK)){
+ 		__set_current_state(TASK_RUNNING);
+ 		atbm_printk_err("%s:Miss\n",__func__);
+ 		atbm_sdio_miss_irq(hw_priv->sbus_priv);
+@@ -325,6 +328,12 @@
+ 	u16 ctrl_reg = 0;
+ 	struct sbus_priv *self = (struct sbus_priv *)thread->self;
+ 	struct atbm_common *hw_priv = self->core;
++	/* T23ZN: only poll/re-arm once the firmware is up. Running this during the firmware download
++	 * (pre_sched armed from cycle 0) busy-loops on ctrl_reg and starves the WSM-startup RX
++	 * (RT throttling), stalling init in the real rootfs. STARTUP_IND arrives on the initially-armed
++	 * IRQ; from firmwareReady on we re-arm the chip IRQ so the next confirm (get_config) is delivered. */
++	if (!hw_priv->wsm_caps.firmwareReady)
++		return 0;
+ 	#ifdef LINUX_OS
+ 	hw_priv->sbus_ops->lock(hw_priv->sbus_priv);
+ 	atbm_bh_read_ctrl_reg_unlock(hw_priv, &ctrl_reg);
+@@ -570,7 +579,13 @@
+ 	thread->thread_fn = atbm_sdio_rx_thread;
+ 	thread->post_sched = atbm_sdio_rx_post_sched;
+ 	thread->wakeup_period = msecs_to_jiffies(30);
+-	thread->pre_sched  = NULL;
++	/* T23ZN/ATBM6441 fix: arm the RX poll+chip-IRQ-rearm hook from cycle 0, not only after the
++	 * first THREAD_WAKEUP. On hosts that do not keep the SDIO in-band card IRQ enabled across
++	 * frames, leaving this NULL means the chip IRQ is never re-armed after WSM_STARTUP_IND, so the
++	 * first post-startup WSM confirm (get_config in atbm_get_mac_address) is never delivered, init
++	 * stalls before wlan0 registration and hw_net_cfg_ok is never set. atbm_sdio_rx_pre_sched is
++	 * idempotent (same hook post_sched installs after the first wakeup). */
++	thread->pre_sched  = atbm_sdio_rx_pre_sched;
+ 	thread->self = self;
+ 	if(atbm_sdio_thread_init(thread)){
+ 		#ifndef LINUX_OS
+--- a/hal_apollo/atbm_ioctl.c	2026-07-20 14:07:22.555571108 +0200
++++ b/hal_apollo/atbm_ioctl.c	2026-07-20 14:07:22.560325350 +0200
+@@ -1510,6 +1510,25 @@
+ 	return ret;
+ }
+ 
++int atbm_wsm_send_general_cmd(struct atbm_common *hw_priv, unsigned long buff)
++{
++	int ret = 0;
++	u8 req[ATBM_GENERAL_CMD_LEN];
++
++	memset(req, 0, sizeof(req));
++	if (0 != copy_from_user(req, (void __user *)buff, ATBM_GENERAL_CMD_LEN))
++	{
++		atbm_printk_err("%s: copy_from_user err.\n", __func__);
++		return -EFAULT;
++	}
++
++	ret = wsm_send_general_cmd(hw_priv, req, ATBM_GENERAL_CMD_LEN);
++	if (ret)
++		atbm_printk_err("%s: wsm_send_general_cmd err %d\n", __func__, ret);
++
++	return ret;
++}
++
+ int atbm_wsm_customer_cert_save(struct atbm_common *hw_priv, unsigned long buff)
+ {
+ 	int ret = 0;
+@@ -1833,6 +1852,11 @@
+ 		case ATBM_CHECK_ALIVE:
+ 			ret = atbm_wsm_start_check_alive(((struct atbm_info *)(filp->private_data))->hw_priv, arg);
+ 			break;
++		case ATBM_MCU_GENERAL_CMD:   /* _IOW(121,70)=0x80047946: the ioctl librtos/mcu_test/z7682
++		                              * actually call for MCU commands (wdt-disable, PIR, battery,
++		                              * floodlight). Forwards the 532B packet to the Z7682 via WSM 0x003A. */
++			ret = atbm_wsm_send_general_cmd(((struct atbm_info *)(filp->private_data))->hw_priv, arg);
++			break;
+ 		default:
+ 			atbm_printk_err("%s cmd %d invalid.\n", __func__, cmd);
+ 			ret = -1;
+--- a/hal_apollo/atbm_ioctl_ext.h	2026-07-20 14:07:22.564249412 +0200
++++ b/hal_apollo/atbm_ioctl_ext.h	2026-07-20 14:07:22.568173474 +0200
+@@ -58,6 +58,11 @@
+ #define ATBM_CUSTOMER_CMD         _IOW(ATBM_IOCTL,50, unsigned int)
+ #define ATBM_CUSTOMER_CERT        _IOW(ATBM_IOCTL,51, unsigned int)
+ #define ATBM_CHECK_ALIVE          _IOW(ATBM_IOCTL,52, unsigned int)
++/* Vendor MCU general-command ioctl. librtos.so / mcu_test / z7682_disable_wdt call _IOW(121,70) =
++ * 0x80047946 (nr 70), NOT nr 52 — gtxaspec's ioctl table diverged and never defined it, so those
++ * calls hit the switch default and returned -1 ("ioctl ATBM_GENERAL_CMD error"). This carries the
++ * 532B {magic 0xACACCACA, cmd, crc32, retcode, payload_len, data[512]} SPI packet to the Z7682 MCU. */
++#define ATBM_MCU_GENERAL_CMD      _IOW(ATBM_IOCTL,70, unsigned int)
+ 
+ #endif /* ATBM_IOCTL_EXT_H */
+ 
+--- a/hal_apollo/wsm.c	2026-07-20 14:07:22.572070410 +0200
++++ b/hal_apollo/wsm.c	2026-07-20 14:07:22.576021598 +0200
+@@ -892,6 +892,7 @@
+ 		case WSM_CLEAR_WK_SSID_RESP_ID:
+ 		case WSM_AUTO_RECONNECT_RESP_ID:
+ 		case WSM_WAKEUP_EVENT_RESP_ID:
++		case WSM_GENERAL_CMD_RESP_ID:   /* 0x043A: Z7682 MCU general-command confirm (wdt/PIR/battery/...) */
+ 		case WSM_CUSTOMER_CMD_RESP_ID:
+ 		case WSM_CUSTOMER_CERT_SAVE_RESP_ID:
+ 			WARN_ON(wsm_arg != NULL);
+@@ -1993,6 +1994,31 @@
+ 
+ 	wsm_cmd_unlock(hw_priv);
+ 	return ret;
++
++nomem:
++	wsm_cmd_unlock(hw_priv);
++	return -ENOMEM;
++}
++
++/* T23ZN/vendor compat: forward a raw 532B ACACCACA command to the Z7682 MCU as WSM general command
++ * 0x003A. This is the channel librtos/mcu_test/z7682_disable_wdt use (cmd 0x13 = MCU watchdog off,
++ * 0x09/0x0a = PIR, 0x1a/0x1b = battery, floodlight, ...). It MUST go through the WSM *command*
++ * channel via wsm_cmd_send(), exactly like the vendor's wsm_general_cmd(): that path sets
++ * wsm_cmd.ptr + wsm_cmd_hif_ximt() so the firmware/MCU dispatcher reads it, and the 0x043A confirm
++ * completes it. wsm_cmd_send_no_ack() instead queues to tx_frame_queue (the *data* path), so the
++ * MCU dispatcher never sees the command (ioctl returns 0 but the watchdog is never disabled). */
++int wsm_send_general_cmd(struct atbm_common *hw_priv, void *buffer,size_t buf_size)
++{
++	int ret;
++	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
++
++	wsm_cmd_lock(hw_priv);
++
++	WSM_PUT(buf, buffer, buf_size);
++	ret = wsm_cmd_send(hw_priv, buf, NULL, WSM_GENERAL_CMD_REQ_ID, WSM_CMD_TIMEOUT, 0);
++
++	wsm_cmd_unlock(hw_priv);
++	return ret;
+ 
+ nomem:
+ 	wsm_cmd_unlock(hw_priv);
+--- a/hal_apollo/wsm.h	2026-07-20 14:07:22.582341255 +0200
++++ b/hal_apollo/wsm.h	2026-07-20 14:07:22.583869723 +0200
+@@ -2137,6 +2137,11 @@
+ 
+ int wsm_send_customer_cmd(struct atbm_common *hw_priv, void *buffer,size_t buf_size);
+ 
++#define WSM_GENERAL_CMD_REQ_ID       0x003A
++#define WSM_GENERAL_CMD_RESP_ID      0x043A
++#define ATBM_GENERAL_CMD_LEN         532
++int wsm_send_general_cmd(struct atbm_common *hw_priv, void *buffer,size_t buf_size);
++
+ struct wsm_customer_cert_save_req{
+ 	u32 status;
+ 	u32 cert_type;
+@@ -2158,8 +2163,11 @@
+ 	u32 tmo_cnt;
+ };
+ 
+-#define WSM_CHECK_ALIVE_REQ_ID      0x003A
+-#define WSM_CHECK_ALIVE_RESP_ID     0x043A
++/* Vendor RE (atbm6041/6461 wsm_check_alive): the SDIO keep-alive channel is 0x003C, NOT 0x003A.
++ * 0x003A is the MCU general-command channel (WSM_GENERAL_CMD_*). The old 0x003A collision made the
++ * general-cmd confirm indistinguishable from the check-alive confirm. */
++#define WSM_CHECK_ALIVE_REQ_ID      0x003C
++#define WSM_CHECK_ALIVE_RESP_ID     0x043C
+ 
+ int wsm_check_alive(struct atbm_common *hw_priv, void *buffer,size_t buf_size);
+ 

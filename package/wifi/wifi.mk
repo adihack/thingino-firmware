@@ -107,7 +107,9 @@ WIFI_IS_FAMILY_HI_FLAG   := $(if $(filter hi%,$(WLAN_MODULE)),1,0)
 WIFI_IS_FAMILY_MTK_FLAG  := $(if $(filter mt7%,$(WLAN_MODULE)),1,0)
 WIFI_IS_FAMILY_RTL_FLAG  := $(if $(filter rtl% 818% 87% 88%,$(WLAN_MODULE)),1,0)
 WIFI_IS_FAMILY_SSV_FLAG  := $(if $(filter ssv%,$(WLAN_MODULE)),1,0)
-WIFI_IS_ATBM6461_FLAG    := $(if $(filter BR2_PACKAGE_WIFI_ATBM6461,$(WIFI_DRIVER_BR2_PACKAGE)),1,0)
+# ATBM SDIO firmware-offload family (6461 blob + 6441 source): both drive WiFi
+# via /dev/atbm_ioctl (mcu_test/wext), not nl80211, and skip host MAC-set.
+WIFI_IS_ATBM6461_FLAG    := $(if $(filter BR2_PACKAGE_WIFI_ATBM6461 BR2_PACKAGE_WIFI_ATBM6441,$(WIFI_DRIVER_BR2_PACKAGE)),1,0)
 
 WIFI_SDIO_SET_GPIO_FLAG := 0
 WIFI_SDIO_RETURN_EARLY_FLAG := 0

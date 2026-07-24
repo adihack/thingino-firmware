@@ -1,7 +1,23 @@
 config BR2_PACKAGE_WIFI_ATBM6441
-	bool "AltoBeam ATBM6441"
+	bool "AltoBeam ATBM6441 (source)"
 	select BR2_LINUX_KERNEL
 	select BR2_PACKAGE_THINGINO_KOPT_MMC
+	select BR2_PACKAGE_ATBM6461_TOOLS
 	help
-	  Wireless driver atbm6441
-	  altobeam hare atbm6441 WiFi driver
+	  AltoBeam ATBM6441 (Hera) SDIO WiFi + Z7682 MCU combo driver,
+	  built FROM SOURCE (github.com/gtxaspec/atbm6441) rather than
+	  shipping a prebuilt .ko blob.
+
+	  This is the first-class driver for cameras whose physical chip
+	  is an ATBM6441 (e.g. Cinnado S2). It carries the Cinnado S2 /
+	  T23ZN CMD53-survivability fix as a source patch
+	  (package/all-patches/wifi-atbm6441/), builds z7682_disable_wdt
+	  from recovered source, ships librtos.so for MCU watchdog comms
+	  via /dev/atbm_ioctl, and selects atbm6461-tools for the MCU
+	  WiFi/battery/PIR commands.
+
+	  WiFi is controlled through /dev/atbm_ioctl (WSM), not
+	  wpa_supplicant/nl80211 -- the firmware runs the MAC on-chip.
+
+	  Distinct from wifi-atbm6461, which ships a recovery-extracted
+	  blob shared by the B6/A1 cameras; select exactly one.
