@@ -37,8 +37,8 @@ control is dead.
 Signed-off-by: Adrian Soltys <adrian.soltys@seelso.net>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
---- a/hal_apollo/hwio_sdio.c	2026-07-20 14:07:22.522155240 +0200
-+++ b/hal_apollo/hwio_sdio.c	2026-07-20 14:07:22.532856915 +0200
+--- a/hal_apollo/hwio_sdio.c
++++ b/hal_apollo/hwio_sdio.c
 @@ -282,8 +282,13 @@
  			hw_priv->buf_id_rx = buf_id_rx;
  			break;
@@ -66,8 +66,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  			atbm_dbg(ATBM_APOLLO_DBG_ERROR, "%s,%d,error :[%d]\n",
  					__func__, __LINE__, ret);
  		}
---- a/hal_apollo/apollo_sdio.c	2026-07-20 14:07:22.538495747 +0200
-+++ b/hal_apollo/apollo_sdio.c	2026-07-20 14:07:22.548553163 +0200
+--- a/hal_apollo/apollo_sdio.c
++++ b/hal_apollo/apollo_sdio.c
 @@ -306,8 +306,11 @@
  		ret = 1;
  		goto exit;
@@ -110,9 +110,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  	thread->self = self;
  	if(atbm_sdio_thread_init(thread)){
  		#ifndef LINUX_OS
---- a/hal_apollo/atbm_ioctl.c	2026-07-20 14:07:22.555571108 +0200
-+++ b/hal_apollo/atbm_ioctl.c	2026-07-20 14:07:22.560325350 +0200
-@@ -1510,6 +1510,25 @@
+--- a/hal_apollo/atbm_ioctl.c
++++ b/hal_apollo/atbm_ioctl.c
+@@ -1510,6 +1510,36 @@
  	return ret;
  }
  
@@ -129,16 +129,27 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 +	}
 +
 +	ret = wsm_send_general_cmd(hw_priv, req, ATBM_GENERAL_CMD_LEN);
-+	if (ret)
++	if (ret) {
 +		atbm_printk_err("%s: wsm_send_general_cmd err %d\n", __func__, ret);
++		return ret;
++	}
 +
-+	return ret;
++	/* wsm_send_general_cmd passed a non-NULL wsm_arg, so the 0x043A confirm
++	 * (wsm_generic_get_confirm) copied the 532B MCU reply back into req[].
++	 * Hand it to userspace so GET commands (battery/version/wdt-ack) return data. */
++	if (0 != copy_to_user((void __user *)buff, req, ATBM_GENERAL_CMD_LEN))
++	{
++		atbm_printk_err("%s: copy_to_user err.\n", __func__);
++		return -EFAULT;
++	}
++
++	return 0;
 +}
 +
  int atbm_wsm_customer_cert_save(struct atbm_common *hw_priv, unsigned long buff)
  {
  	int ret = 0;
-@@ -1833,6 +1852,11 @@
+@@ -1833,6 +1863,11 @@
  		case ATBM_CHECK_ALIVE:
  			ret = atbm_wsm_start_check_alive(((struct atbm_info *)(filp->private_data))->hw_priv, arg);
  			break;
@@ -150,8 +161,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  		default:
  			atbm_printk_err("%s cmd %d invalid.\n", __func__, cmd);
  			ret = -1;
---- a/hal_apollo/atbm_ioctl_ext.h	2026-07-20 14:07:22.564249412 +0200
-+++ b/hal_apollo/atbm_ioctl_ext.h	2026-07-20 14:07:22.568173474 +0200
+--- a/hal_apollo/atbm_ioctl_ext.h
++++ b/hal_apollo/atbm_ioctl_ext.h
 @@ -58,6 +58,11 @@
  #define ATBM_CUSTOMER_CMD         _IOW(ATBM_IOCTL,50, unsigned int)
  #define ATBM_CUSTOMER_CERT        _IOW(ATBM_IOCTL,51, unsigned int)
@@ -164,17 +175,41 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  
  #endif /* ATBM_IOCTL_EXT_H */
  
---- a/hal_apollo/wsm.c	2026-07-20 14:07:22.572070410 +0200
-+++ b/hal_apollo/wsm.c	2026-07-20 14:07:22.576021598 +0200
-@@ -892,6 +892,7 @@
- 		case WSM_CLEAR_WK_SSID_RESP_ID:
- 		case WSM_AUTO_RECONNECT_RESP_ID:
- 		case WSM_WAKEUP_EVENT_RESP_ID:
-+		case WSM_GENERAL_CMD_RESP_ID:   /* 0x043A: Z7682 MCU general-command confirm (wdt/PIR/battery/...) */
- 		case WSM_CUSTOMER_CMD_RESP_ID:
- 		case WSM_CUSTOMER_CERT_SAVE_RESP_ID:
- 			WARN_ON(wsm_arg != NULL);
-@@ -1993,6 +1994,31 @@
+--- a/hal_apollo/bh_sdio.c
++++ b/hal_apollo/bh_sdio.c
+@@ -107,10 +107,17 @@
+ 				status = -1;
+ 				goto exit;
+ 		} else if (unlikely(!rx_resync)) {
+-			if (WARN_ON(wsm_seq != hw_priv->wsm_rx_seq)) {
+-				atbm_printk_err("(wsm_seq %d != hw_priv->wsm_rx_seq %d) \n",wsm_seq , hw_priv->wsm_rx_seq);
+-				status = -2;
+-				goto exit;
++			if (wsm_seq != hw_priv->wsm_rx_seq) {
++				/* FIX: the thingino jzmmc CMD53 RX path can silently drop a
++				 * frame, desyncing the 3-bit rx seq. The old code then
++				 * HARD-DROPPED every later frame (goto exit) with no recovery,
++				 * so the MCU 0x043A confirm never reached wsm_handle_rx and
++				 * wsm_cmd_send hung its 60s timeout (SEND works, GET hangs).
++				 * Resync to the received seq and KEEP the frame instead of
++				 * wedging the confirm plane. atbm_printk_always bypasses mask. */
++				atbm_printk_always("atbm rxseq RESYNC exp=%d got=%d id=%x\n",
++						hw_priv->wsm_rx_seq, wsm_seq, wsm_id);
++				hw_priv->wsm_rx_seq = wsm_seq;
+ 			}
+ 		}
+ 		hw_priv->wsm_rx_seq = (wsm_seq + 1) & 7;
+--- a/hal_apollo/wsm.c
++++ b/hal_apollo/wsm.c
+@@ -849,6 +849,7 @@
+ 		case WSM_GET_TIME_RESP_ID:
+ 		case WSM_GET_ETF_RX_INFO_RESP_ID:
+ 		case WSM_CONN_LOSE_RESP_ID:
++		case WSM_GENERAL_CMD_RESP_ID:   /* 0x043A: Z7682 MCU reply -> capture 532B into wsm_arg->buf */
+ 			if (likely(wsm_arg))
+ 				ret = wsm_generic_get_confirm(hw_priv,
+ 									wsm_arg,
+@@ -1993,6 +1994,35 @@
  
  	wsm_cmd_unlock(hw_priv);
  	return ret;
@@ -195,19 +230,23 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 +{
 +	int ret;
 +	struct wsm_buf *buf = &hw_priv->wsm_cmd_buf;
++	/* NON-NULL arg: the 0x043A confirm (wsm_generic_get_confirm) copies the
++	 * 532B MCU reply back into 'buffer'. NULL here discards the reply, which is
++	 * why battery/version/wdt-ack read back all-zero. */
++	struct wsm_generic_get_arg_s arg = { .buf = buffer, .buf_size = buf_size };
 +
 +	wsm_cmd_lock(hw_priv);
 +
 +	WSM_PUT(buf, buffer, buf_size);
-+	ret = wsm_cmd_send(hw_priv, buf, NULL, WSM_GENERAL_CMD_REQ_ID, WSM_CMD_TIMEOUT, 0);
++	ret = wsm_cmd_send(hw_priv, buf, &arg, WSM_GENERAL_CMD_REQ_ID, WSM_CMD_TIMEOUT, 0);
 +
 +	wsm_cmd_unlock(hw_priv);
 +	return ret;
  
  nomem:
  	wsm_cmd_unlock(hw_priv);
---- a/hal_apollo/wsm.h	2026-07-20 14:07:22.582341255 +0200
-+++ b/hal_apollo/wsm.h	2026-07-20 14:07:22.583869723 +0200
+--- a/hal_apollo/wsm.h
++++ b/hal_apollo/wsm.h
 @@ -2137,6 +2137,11 @@
  
  int wsm_send_customer_cmd(struct atbm_common *hw_priv, void *buffer,size_t buf_size);
