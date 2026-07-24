@@ -244,6 +244,66 @@ stop_client() {
 	ip addr flush dev $IFACE 2>/dev/null
 }
 
+# --- ATBM6441 firmware-internal SoftAP (Cinnado S2) -------------------------
+# The ATBM6441 WiFi core runs its OWN AP + DHCP + gateway on 192.168.43.1
+# (associated clients get 192.168.43.200). We cannot change that. So the config
+# portal must live at 192.168.43.2 (static) and we must NOT run udhcpd/dnsd here.
+ATBM_AP_IP=192.168.43.2
+ATBM_AP_CHAN=6
+
+start_atbm_softap() {
+	local ssid suffix
+
+	if ! command -v atbm_softap >/dev/null 2>&1; then
+		echo "atbm_softap not found; ATBM6441 SoftAP cannot start" >&2
+		exit 1
+	fi
+
+	ssid=$(grep 'ssid=' $CONFIG | head -1 | sed 's/.*ssid="\([^"]*\)".*/\1/')
+	case "$ssid" in
+		"" | THINGINO | THINGINO-)
+			suffix=$(ip link show $IFACE | awk '/ether/ {print $2}' | awk -F: '{print $(NF-1) $NF}')
+			ssid="THINGINO-${suffix}"
+			;;
+	esac
+
+	echo "Bring $IFACE up"
+	ip link set $IFACE up
+	echo "Waiting for SDIO link to stabilize..."
+	sleep 3
+
+	echo "Starting ATBM6441 SoftAP '$ssid' ch${ATBM_AP_CHAN}"
+	if ! atbm_softap "$ssid" "$ATBM_AP_CHAN"; then
+		echo "WARNING: atbm_softap failed" >&2
+	fi
+
+	# Trigger the Z7682 MCU to OPEN + beacon the AP (opcode 12 = wifi_set_ap_open, sent on the
+	# MCU general-cmd channel nr70). On this MCU-managed WiFi the WiFi-core AP_CFG above only
+	# WRITES the SSID config; this MCU command is what actually starts the AP beacon.
+	sleep 1
+	if command -v mcu_test >/dev/null 2>&1; then
+		mcu_test --send-raw=12 >/dev/null 2>&1 || echo "WARNING: mcu op12 (wifi_set_ap_open) failed" >&2
+	fi
+
+	echo "Assign $ATBM_AP_IP/24 to $IFACE (firmware owns .1 gateway+DHCP)"
+	ip addr flush dev $IFACE 2>/dev/null
+	ip addr add ${ATBM_AP_IP}/24 dev $IFACE 2>/dev/null || true
+	ip link set $IFACE up
+
+	echo "Start config portal on http://$ATBM_AP_IP (no udhcpd/dnsd - firmware serves them)"
+	start-stop-daemon -S -x /usr/bin/uhttpd -- -h /var/www-portal -x /x -t 0 -T 15 -k 10 -n 20 -N 100 -p ${ATBM_AP_IP}:80 -E /x/portal.cgi 2>&1
+
+	touch "$WLANAP_MODE_FLAG"
+	echo "ATBM6441 SoftAP portal ready at http://$ATBM_AP_IP"
+}
+
+stop_atbm_softap() {
+	start-stop-daemon -K -q -x /usr/bin/uhttpd 2>/dev/null
+	ip addr flush dev $IFACE 2>/dev/null
+	ip link set $IFACE down 2>/dev/null
+	rm -f "$WLANAP_MODE_FLAG"
+}
+
 start() {
 	# Credential from SD card
 	credentials_from_card
@@ -318,8 +378,14 @@ start() {
 	esac
 
 	case "$mode" in
-		portal) prepare_portal ;;
-		ap) start_access_point ;;
+		portal | ap)
+			case "$WLAN_MODULE_NAME" in
+				atbm64*) start_atbm_softap ;;
+				*)
+					if [ "$mode" = "portal" ]; then prepare_portal; else start_access_point; fi
+					;;
+			esac
+			;;
 		*) start_client ;;
 	esac
 }
@@ -328,8 +394,14 @@ stop() {
 	echo -c 15 "Stopping WPA Supplicant"
 
 	case "$mode" in
-		portal) stop_portal ;;
-		ap) stop_access_point ;;
+		portal | ap)
+			case "$WLAN_MODULE_NAME" in
+				atbm64*) stop_atbm_softap ;;
+				*)
+					if [ "$mode" = "portal" ]; then stop_portal; else stop_access_point; fi
+					;;
+			esac
+			;;
 		*) stop_client ;;
 	esac
 }
