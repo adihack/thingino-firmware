@@ -1,4 +1,19 @@
 serialport=ttyS1
-# WDT_DISABLE=1 makes U-Boot auto-disable the Z7682 MCU watchdog on every boot
-# (board_late_init) for console-less experimental builds. 0/unset = wdt armed.
+
+# MCU watchdog stays ARMED on a normal boot (WDT_DISABLE=0). It is disabled ONLY inside
+# the SD-card flash sequences below, and ONLY once a valid update file is confirmed on
+# the card - so a normal boot (no card / no update file) keeps its watchdog protection.
 WDT_DISABLE=0
+
+# --- SD-card recovery, two modes selected by the file name on the FAT card ----------
+# au_os   : autoupdate-os.bin   -> flash OS ONLY (kernel+rootfs+data, 0x60000..end);
+#           bootloader (0x0..0x60000) never touched -> an interrupted flash is retryable,
+#           not a brick. SAFE default. RAM src = loadaddr(0x80600000)+0x60000 = 0x80660000.
+# au_full : autoupdate-full.bin -> whole chip incl. U-Boot (deliberate; keep CH341A handy).
+# In BOTH: the Z7682 MCU watchdog is disabled ('atbm wdt off') only AFTER fatsize confirms
+# the file exists (the full-chip erase takes minutes, longer than the ~14.5s wdt) - if the
+# file is absent, the wdt is left armed.
+# autoupdate (run by bootcmd) tries au_os first (safe), then au_full. Same image, name picks mode.
+au_os=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-os.done; then echo "AU: os already applied"; else if fatsize mmc 0:1 autoupdate-os.bin; then echo "AU: os update found; disabling MCU wdt for the flash"; atbm wdt off; if fatload mmc 0:1 ${loadaddr} autoupdate-os.bin; then echo "AU: flashing OS only (U-Boot preserved)"; if sf probe && sf erase 0x60000 0xfa0000 && sf write 0x80660000 0x60000 0xfa0000; then fatwrite mmc 0:1 ${loadaddr} autoupdate-os.done 1; echo "AU: os done, rebooting"; reset; fi; fi; fi; fi; fi
+au_full=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-full.done; then echo "AU: full already applied"; else if fatsize mmc 0:1 autoupdate-full.bin; then echo "AU: full update found; disabling MCU wdt for the flash"; atbm wdt off; if fatload mmc 0:1 ${loadaddr} autoupdate-full.bin; then echo "AU: flashing FULL chip (incl U-Boot)"; if sf probe && sf erase 0 ${flash_len} && sf write ${loadaddr} 0 ${filesize}; then fatwrite mmc 0:1 ${loadaddr} autoupdate-full.done 1; echo "AU: full done, rebooting"; reset; fi; fi; fi; fi; fi
+autoupdate=run au_os; run au_full

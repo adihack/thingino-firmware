@@ -1077,7 +1077,9 @@ $(U_BOOT_ENV_TXT): $(ROOTFS_BIN)
 	for file in $(THINGINO_USER_UENV_FILES); do \
 		grep -v '^#' "$$file" | awk NF | tee -a $@; \
 	done
-	sort -u -o $@ $@
+	# dedup by key, keep last value (so <camera>.uenv.txt overrides common.uenv.txt);
+	# sort -u only dropped identical lines, leaving duplicate keys.
+	awk -F= '{ if(!($$1 in _s)){_o[++_n]=$$1}; _s[$$1]=$$0 } END{ for(_i=1;_i<=_n;_i++) print _s[_o[_i]] }' $@ > $@.dedup && mv $@.dedup $@
 	# Remove any existing mtdparts and bootcmd lines (will be regenerated with aligned sizes)
 	sed -i '/^mtdparts=/d; /^bootcmd=/d; /^kern_addr=/d; /^kern_size=/d; /^data_addr=/d; /^data_size=/d; /^overlay_wipe=/d' $@
 	echo 'overlay_wipe=echo "wiping overlay"; sf probe && sf erase $${data_addr} $${data_size} && echo "overlay wipe done"' >> $@
