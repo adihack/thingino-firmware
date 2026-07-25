@@ -1,7 +1,7 @@
 From: Adrian Soltys <adrian.soltys@seelso.net>
-Subject: [PATCH] atbm6441: Cinnado S2 / T23ZN compat (CMD53 survival + Z7682 MCU bridge)
+Subject: [PATCH] atbm6441: Cinnado S2 / T23ZN compat (CMD53 survival + Z7682 MCU bridge + button/PIR events)
 
-Two board-specific fixes for running the gtxaspec/atbm6441 driver on the
+Three board-specific fixes for running the gtxaspec/atbm6441 driver on the
 Cinnado S2 (Ingenic T23ZN + ATBM6441 "Hera" SDIO WiFi with an on-package
 Z7682 MCU).
 
@@ -33,6 +33,20 @@ This adds atbm_wsm_send_general_cmd() to forward that packet to the MCU as
 WSM general command 0x003A and match its 0x043A confirm. Without it the
 Cinnado S2 reboot-loops (watchdog never disabled) and all MCU peripheral
 control is dead.
+
+== Part 3: forward Z7682 MCU sensor/button events to userspace ==
+main.c, atbm_ioctl.c, atbm_ioctl.h, wsm.c
+
+The MCU pushes RST-button and PIR events to the host as a WSM event
+indication (0x0805) with eventId 16, payload word0 = a bitmask (0x01 KEY0
+press, 0x02 KEY0 release, 0x08 PIR, 0x4000 tamper). Both wsm_event_indication
+and atbm_event_handler dropped it: eventId 16 is not in the "needs no vif"
+list, so the vif-gate silently discarded it, and there was no case 16 in the
+handler. Whitelist eventId 15/16 in both gates, add a case-16 handler that
+forwards the bitmask via a new atbm_ioctl_customer_async() (status_async
+type=6, bitmask at offset 4, kill_fasync SIGIO), and drain it through a
+16-deep ring buffer so a fast press/release/PIR burst is never coalesced by
+the single status latch. Companion userspace listener: files/mcu_evt.c.
 
 Signed-off-by: Adrian Soltys <adrian.soltys@seelso.net>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
@@ -112,7 +126,46 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  		#ifndef LINUX_OS
 --- a/hal_apollo/atbm_ioctl.c
 +++ b/hal_apollo/atbm_ioctl.c
-@@ -1510,6 +1510,36 @@
+@@ -60,6 +60,14 @@
+ 
+ static struct fasync_struct *connect_async;
+ static struct status_async status;
++
++/* PART-B: ring buffer of Z7682 MCU sensor/button events (eventId 16) so a
++ * fast press/release/PIR burst is never coalesced by the single 'status' latch.
++ * Each slot is the word0 bitmask (0x01 press, 0x02 release, 0x08 PIR, 0x4000 tamper). */
++#define CUST_RING_SZ 16
++static u32 cust_ring[CUST_RING_SZ];
++static unsigned int cust_head, cust_tail;   /* monotonic; count = head - tail */
++static DEFINE_SPINLOCK(cust_lock);
+ #endif
+ 
+ static struct wsm_scan_result_req result;
+@@ -128,6 +136,23 @@
+ 	#endif
+ }
+ 
++/* PART-B: forward a Z7682 MCU sensor/button event (eventId 16) to userspace.
++ * 'code' is the payload word0 bitmask (0x01 KEY0 press, 0x02 KEY0 release,
++ * 0x08 PIR, 0x4000 tamper). Pushed into cust_ring; drained one-per-read() as
++ * a type=6 status_async whose event[0..3] hold the bitmask. */
++void atbm_ioctl_customer_async(unsigned int code)
++{
++	#ifdef LINUX_OS
++	spin_lock_bh(&cust_lock);
++	cust_ring[cust_head % CUST_RING_SZ] = code;
++	cust_head++;
++	if (cust_head - cust_tail > CUST_RING_SZ)   /* full -> drop oldest */
++		cust_tail = cust_head - CUST_RING_SZ;
++	spin_unlock_bh(&cust_lock);
++	kill_fasync (&connect_async, SIGIO, POLL_IN);
++	#endif
++}
++
+ int atbm_wsm_ps(struct atbm_common *hw_priv, unsigned int data)
+ {
+ 	int ret = 0;
+@@ -1510,6 +1535,36 @@
  	return ret;
  }
  
@@ -149,7 +202,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  int atbm_wsm_customer_cert_save(struct atbm_common *hw_priv, unsigned long buff)
  {
  	int ret = 0;
-@@ -1833,6 +1863,11 @@
+@@ -1833,6 +1888,11 @@
  		case ATBM_CHECK_ALIVE:
  			ret = atbm_wsm_start_check_alive(((struct atbm_info *)(filp->private_data))->hw_priv, arg);
  			break;
@@ -161,6 +214,55 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  		default:
  			atbm_printk_err("%s cmd %d invalid.\n", __func__, cmd);
  			ret = -1;
+@@ -1885,11 +1945,38 @@
+ 
+ static ssize_t atbm_ioctl_read(struct file *filp, char __user *buff, size_t len, loff_t *off)
+ {
++	u32 code;
++	int have_cust = 0;
++
+ 	if (sizeof(struct status_async) > len)
+ 	{
+ 		atbm_printk_err("%s: buff len is not enough.\n", __func__);
+ 		return -1;
+ 	}
++
++	/* PART-B: drain the MCU customer-event ring first, one event per read().
++	 * Build the reply locally so we never race the shared 'status' latch. */
++	spin_lock_bh(&cust_lock);
++	if (cust_tail != cust_head) {
++		code = cust_ring[cust_tail % CUST_RING_SZ];
++		cust_tail++;
++		have_cust = 1;
++	}
++	spin_unlock_bh(&cust_lock);
++
++	if (have_cust) {
++		struct status_async cust;
++		memset(&cust, 0, sizeof(cust));
++		cust.type = 6;
++		memcpy(&cust.event, &code, sizeof(code));  /* bitmask at offset 4 */
++		if (0 != copy_to_user(buff, &cust, sizeof(cust)))
++		{
++			atbm_printk_err("%s: copy_to_user err.\n", __func__);
++			return -1;
++		}
++		return sizeof(cust);
++	}
++
+ 	if (0 != copy_to_user(buff, &status, sizeof(status)))
+ 	{
+ 		atbm_printk_err("%s: copy_to_user err.\n", __func__);
+--- a/hal_apollo/atbm_ioctl.h
++++ b/hal_apollo/atbm_ioctl.h
+@@ -17,6 +17,7 @@
+ void atbm_ioctl_wakeup_async(int reason);
+ void atbm_ioctl_disconn_async(int reason);
+ void atbm_ioctl_conn_err_async(int reason);
++void atbm_ioctl_customer_async(unsigned int code);  /* PART-B: MCU sensor/button event */
+ 
+ int atbm_wsm_ps(struct atbm_common *hw_priv, unsigned int data);
+ int atbm_wsm_connect(struct atbm_common *hw_priv, unsigned int data);
 --- a/hal_apollo/atbm_ioctl_ext.h
 +++ b/hal_apollo/atbm_ioctl_ext.h
 @@ -58,6 +58,11 @@
@@ -201,7 +303,27 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  		hw_priv->wsm_rx_seq = (wsm_seq + 1) & 7;
 --- a/hal_apollo/wsm.c
 +++ b/hal_apollo/wsm.c
-@@ -849,6 +849,7 @@
+@@ -213,7 +213,9 @@
+ 		&& (eventid != WSM_EVENT_HOST_INSMOD)
+ 		&& (eventid != WSM_EVENT_HOST_WAKEUP_REASON)
+ 		&& (eventid != WSM_EVENT_HOST_DISCONN_REASON)
+-		&& (eventid != WSM_EVENT_HOST_CONN_ERR_REASON)){
++		&& (eventid != WSM_EVENT_HOST_CONN_ERR_REASON)
++		&& (eventid != WSM_EVENT_HOST_CUSTOMER_CMD_REQ)
++		&& (eventid != 16)){ /* PART-B: MCU customer(15)/button+PIR(16) events carry no wifi vif -> don't drop */
+ 		priv = ABwifi_hwpriv_to_vifpriv(hw_priv, interface_link_id);
+ 
+ 		if (unlikely(!priv)) {
+@@ -242,7 +244,7 @@
+ 			return 0;
+ 		}
+ 
+-		event->evt.eventId = eventid;	
++		event->evt.eventId = eventid;
+ 		WSM_GET(buf, event->evt.buffer,MAX_SDIO_EVENT_BUFFER_LEN);
+ 		event->if_id = interface_link_id;
+ 
+@@ -849,6 +851,7 @@
  		case WSM_GET_TIME_RESP_ID:
  		case WSM_GET_ETF_RX_INFO_RESP_ID:
  		case WSM_CONN_LOSE_RESP_ID:
@@ -209,7 +331,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  			if (likely(wsm_arg))
  				ret = wsm_generic_get_confirm(hw_priv,
  									wsm_arg,
-@@ -1993,6 +1994,35 @@
+@@ -1993,6 +1996,35 @@
  
  	wsm_cmd_unlock(hw_priv);
  	return ret;
@@ -273,3 +395,32 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  
  int wsm_check_alive(struct atbm_common *hw_priv, void *buffer,size_t buf_size);
  
+--- a/hal_apollo/main.c
++++ b/hal_apollo/main.c
+@@ -157,7 +157,9 @@
+ 			&& (event->evt.eventId != WSM_EVENT_HOST_INSMOD)
+ 			&& (event->evt.eventId != WSM_EVENT_HOST_WAKEUP_REASON)
+ 			&& (event->evt.eventId != WSM_EVENT_HOST_DISCONN_REASON)
+-			&& (event->evt.eventId != WSM_EVENT_HOST_CONN_ERR_REASON)){
++			&& (event->evt.eventId != WSM_EVENT_HOST_CONN_ERR_REASON)
++			&& (event->evt.eventId != WSM_EVENT_HOST_CUSTOMER_CMD_REQ)
++			&& (event->evt.eventId != 16)){ /* PART-B: customer(15)/MCU-sensor(16) events have no vif */
+ 			priv = __ABwifi_hwpriv_to_vifpriv(hw_priv, event->if_id);
+ 			if (!priv) {
+ 				printk( "[CQM] Event for non existing interface, ignoring.\n");
+@@ -266,6 +268,15 @@
+ 				printk("cmdid:%d  data:%s\n", req->cmd_id, req->data);
+ 				break;
+ 			}
++			case 16:  /* PART-B: Z7682 MCU sensor/button event. payload word0 = bitmask:
++			           * 0x01 KEY0 press, 0x02 KEY0 release, 0x08 PIR motion, 0x4000 tamper.
++			           * Forward the raw bitmask to userspace via /dev/atbm_ioctl (type=6 + SIGIO). */
++			{
++				u32 code = __le32_to_cpu(*(u32 *)(event->evt.buffer));
++				printk("mcuevt:0x%x\n", code);
++				atbm_ioctl_customer_async(code);
++				break;
++			}
+ 		}
+ 	}
+ 	mutex_unlock(&hw_priv->conf_mutex);

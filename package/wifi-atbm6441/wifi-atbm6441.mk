@@ -102,9 +102,12 @@ define WIFI_ATBM6441_BUILD_CMDS
 		$(WIFI_ATBM6441_PKGDIR)/files/z7682_disable_wdt.c \
 		-L$(@D) -lrtos \
 		$(TARGET_LDFLAGS)
+	$(TARGET_CC) $(TARGET_CFLAGS) -o $(@D)/mcu_evt \
+		$(WIFI_ATBM6441_PKGDIR)/files/mcu_evt.c \
+		$(TARGET_LDFLAGS)
 endef
 
-# Install the source-built module + source-built librtos.so + z7682 tool.
+# Install the source-built module + source-built librtos.so + z7682 tool + mcu_evt.
 define WIFI_ATBM6441_INSTALL_TARGET_CMDS
 	$(INSTALL) -m 0755 -d \
 		$(TARGET_DIR)/usr/lib/modules/3.10.14$(WIFI_ATBM6441_KERN_LOCALVER)/extra
@@ -115,6 +118,8 @@ define WIFI_ATBM6441_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/lib/librtos.so
 	$(INSTALL) -D -m 0755 $(@D)/z7682_disable_wdt \
 		$(TARGET_DIR)/usr/bin/z7682_disable_wdt
+	$(INSTALL) -D -m 0755 $(@D)/mcu_evt \
+		$(TARGET_DIR)/usr/bin/mcu_evt
 endef
 
 # The gtxaspec source ships MIXED CRLF/LF line endings (e.g. atbm_ioctl_ext.h is
