@@ -764,7 +764,7 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
 | 12 | ISA is NDS32 (§14.1) - deep-firmware convenience only | Only needed for deep firmware work |
 | 13 | Exact CRC algorithm at `message_mgr` fn `0xaa4b4` (host must reproduce it over the payload or the command is dropped). Linux vendor-driver framing already passes it. | Needed to send master_wdt commands from bare-metal U-Boot |
 | 14 | Does `master_mode=0` (msg_id 0x2b) persist across reboot and permanently stop the host-alive reboot? `gp+0x20fc` is read-only in the app image. | Cleanest one-shot fix for a mains-powered cam |
-| 15 | Does the ATBM firmware expose a WSM read-register/peek command so U-Boot can poll RST = `(0x16800020>>17)&1` directly? | Decides RST-button-at-boot feasibility |
+| 15 | ~~WSM read-register/peek command for RST?~~ **ANSWERED (§14.6): NO** - the message_mgr command set has no arbitrary-memory-read handler (the `rmem` strings are AT-console-only). RST (ATBM gpio17) is reachable from the T23 ONLY via the eventId-16 indication, so a U-Boot RST poll would need the event plane up, not a single register read. | RST-button-at-boot is event-plane-only |
 
 ---
 
@@ -934,6 +934,13 @@ dump**. Do not claim it is solved.
 no ATBM cooperation and is immune to whatever the real mechanism is. A sustainable U-Boot feed was
 not achievable (§7.3e). The one thing that *did* change: we can now build byte-correct SDIO command
 frames from U-Boot (§14.4b), so any future host-side control that turns out to help is craftable.
+
+**Candidates for the real mechanism (for a future session):** the reboot is issued by the
+master-power state machine (`master_power_off` @0xaa1d4 -> `host alive failed` @0xa87d0), so
+something posts a master event when SDIO goes quiet. The `LMAC_WDT`/`HMAC_WDT`/`CUSTOMER_WDT`
+"restart CPU" watchdogs in this image restart the *ATBM* core (not the T23) so are probably a
+separate concern. The next step is to dump the running MAC-firmware RAM over `AT+rmem` and look
+for the SDIO-idle host-alive timer there.
 
 ### 14.4b Message framing and the CRC — fully reversed, reproducible [LIVE + RE, CONFIRMED]
 
