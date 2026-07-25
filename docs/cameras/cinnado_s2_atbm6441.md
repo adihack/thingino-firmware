@@ -389,7 +389,7 @@ Vendor arming pattern for its own app watchdog: `enable(0x12)` → `set_period(0
 
 ### 7.3 Mechanism B — a second reset at ~56 s [RESOLVED 2026-07-25, see §14.4]
 
-**RESOLVED by the firmware dump (§14): this is the lp_mgr `master_wdt` host-alive timer.**
+**PARTLY EXPLAINED by the firmware dump (§14), then CORRECTED live (§14.4): the app-level lp_mgr `master_wdt` is DORMANT and is NOT this reset.**
 The ATBM is the SoC power-master; `master_wdt_timer_cb` power-cycles the T23 when the host
 stops kicking it. It is controllable from the T23 over SDIO via `message_mgr` msg_id 0x12
 (STOP) / 0x13 (DELETE) / 0x14 (set period) / 0x15 (kick). The historical notes below are kept
@@ -894,29 +894,84 @@ a frame with a wrong/absent CRC is dropped without error. Our working Linux GETs
 battery) prove the vendor-driver framing (with correct CRC) is accepted; a hand-rolled U-Boot
 frame must reproduce the CRC (fn `0xaa4b4`, not yet byte-reversed) or it is ignored.
 
-### 14.4 RESOLVED: the "~56 s reset" is the lp_mgr master_wdt (host-alive) [RE, CONFIRMED]
+### 14.4 The master_wdt is DORMANT — it is NOT the ~56 s reset [LIVE 2026-07-25, CORRECTS an earlier claim]
 
-Supersedes the "Mechanism B — we do NOT understand" note in §7.3. The ATBM is the **power master**
-of the T23 SoC. `message_mgr` init creates `g_master_wdt_timer` (handle at `gp+0x202c`). If the
-host does not keep it kicked, the expiry callback `master_wdt_timer_cb` (VMA `0xa9ffe`, prints
-`[lp_mgr]master_wdt_timer_cb.`) posts lp_mgr event `0x16`, and the master state machine calls
-`master_power_off` / `master_power_on` (`HI_SDIO_Host_Reboot`, `host alive failed... reboot two
-devices`) — i.e. it **power-cycles the T23**. This is the reset that interrupts a long U-Boot
-flash. It is a *software* timer in this app, entirely distinct from the `0x16600000` hardware
-watchdog (§14.5) which is the ~14.5 s startup wdt and is already off during normal run.
+An earlier version of this section claimed the ~56 s idle-U-Boot reset **is** the lp_mgr
+`master_wdt` and is stopped by msg_id 0x13. **Live inspection of the running chip disproves that.**
 
-**T23-side control (field path):**
-* **Stop it:** send msg_id **0x13** (DELETE) or **0x12** (STOP) — no payload. 
-* **Or set a long period:** msg_id **0x14**, payload word0 = seconds.
-* **Or feed it:** msg_id **0x15** periodically.
-* **Or demote the ATBM:** msg_id **0x2b** payload 0 (`master_mode=0`) — tells the chip it is not
-  the power master (also flips WSM ctx byte[0x99]). Cleanest if it persists; persistence TBC.
+The ATBM *is* the SoC power-master and it *does* contain a `master_wdt` timer (object at
+`0x809298`, callback `master_wdt_timer_cb` @VMA `0xa9ffe`, handle at `gp+0x202c = 0x8099ac`).
+But that timer is **created dormant** and only armed when the host sends msg_id `0x14`
+(SET-PERIOD, payload = seconds). Evidence it is dormant in our setup:
 
-**Why our earlier U-Boot `0x13` did not stop it (§7.3):** most likely the bare-metal U-Boot frame
-was not a valid `message_mgr` message (wrong wrapper / no CRC), so `message_mgr` dropped it while
-the WSM transport still ACKed (`retcode=0`). The definitive test is to send a **properly-framed**
-msg_id 0x13 (the format the Linux driver already uses for working GETs) and confirm the reset
-stops. Until that test, treat the bounded-chunk flash (§7.x `au_os`) as the guaranteed baseline.
+* The timer object at `0x809298` is **byte-for-byte identical across repeated reads seconds
+  apart** — it is not counting and not in the active list (`xTimerListItem.xItemValue` = 0).
+* Decisive logic: if it were armed, the host would have to feed it (msg_id `0x15`) or be rebooted
+  at its period. Our Thingino driver never sends `0x14`/`0x15`, yet **Linux runs for hours with
+  zero resets** (10 h soak). An armed-and-unfed timer cannot coexist with that. Therefore it is
+  dormant.
+
+So the `master_wdt` is a **vendor power-management feature** (arm it so the WiFi chip duty-cycles
+the main SoC on a battery product). On our mains-powered board nothing arms it. Consequences:
+
+* **msg_id 0x13 (DELETE master_wdt) does NOT stop the ~56 s reset** — it deletes a dormant timer.
+  This explains §7.3: the U-Boot `0x13` was a *valid, accepted* frame (its `0xFFFFFFFF` is the
+  correct CRC of an empty payload, see §14.4b) yet the reset still fired — because `0x13` was
+  never the lever.
+* The reboot *path* (`master_power_off` → `host alive failed... reboot two devices` →
+  `HI_SDIO_Host_Reboot`, VMA `0xaa1c4`/`0xa87d0`/`0xa9560`) is real and is the **master-power
+  state machine**, but it is driven by lp_mgr **events**, not by the dormant timer.
+
+**What the ~56 s reset actually is: still open, but bounded.** It is SDIO-activity related — §7.3b/c
+showed that injecting SDIO traffic from U-Boot pushes the deadline out (56 s → ~170 s), so it is a
+**host-alive / SDIO-keepalive** mechanism, not a fixed power-on timer. It is NOT the app-level
+`master_wdt`, and it is NOT reached by the message_mgr msg_ids reversed here. The most likely home
+is a lower layer (the ATHENA_BX MAC firmware or the HIF block) that is **not in this 2 MB XIP
+dump**. Do not claim it is solved.
+
+**Engineering consequence (unchanged and now better-justified):** build the bootloader around
+**bounded-time flash** (`au_os`, each `sf` op < the ~56 s floor, `reset` between chunks) — it needs
+no ATBM cooperation and is immune to whatever the real mechanism is. A sustainable U-Boot feed was
+not achievable (§7.3e). The one thing that *did* change: we can now build byte-correct SDIO command
+frames from U-Boot (§14.4b), so any future host-side control that turns out to help is craftable.
+
+### 14.4b Message framing and the CRC — fully reversed, reproducible [LIVE + RE, CONFIRMED]
+
+Every message_mgr command is a **532-byte packet** (`memset 0x214` in the dispatcher `0xaa956`):
+
+```
+offset 0x00  u32  header / magic (0xACACCACA on the general-cmd path)
+offset 0x04  u32  msg_id            (the command selector; dispatch table §14.3)
+offset 0x08  u32  crc               (checked BEFORE dispatch; mismatch -> silently dropped)
+offset 0x0c  u32  length            (byte length of the payload, used by the CRC)
+offset 0x10  ...  payload[ ]        (up to 512 B)
+```
+
+The dispatcher computes `crc = crc32(payload@0x10, length@0x0c)` (fn `0xaa4b4`) and requires it to
+equal `word[2]`; otherwise it prints `crc(%x) error` and drops the frame.
+
+**The CRC is the standard reflected CRC-32** (the zlib/PKZIP one, poly `0xEDB88320`): the 256-entry
+lookup table lives at `gp+0x2124 = 0x809aa4` and reads `00000000 77073096 EE0E612C 990951BA …`
+(verified live). The routine is:
+
+```c
+uint32_t crc = 0xFFFFFFFF;                       /* init */
+for (i = 0; i < length; i++)
+    crc = table[(crc ^ payload[i]) & 0xFF] ^ (crc >> 8);
+return crc;                                      /* NOTE: NO final XOR / inversion */
+```
+
+Two practical points:
+* It is **not** finalised with `^ 0xFFFFFFFF`, so it is the raw LFSR value, not the usual zlib
+  output. For an **empty payload it returns `0xFFFFFFFF`** — which is exactly the value the U-Boot
+  `atbm wdt off` frame carried, i.e. that frame's CRC was correct all along.
+* Our working Linux GETs (version, battery) pass this check, confirming the algorithm. Any U-Boot /
+  bare-metal sender can now reproduce it with the standard CRC-32 table and no final inversion.
+
+`gp = 0x807980` (proven by the CRC-table location; an earlier note had it wrong at `0x90052c8`).
+Useful gp-relative globals: `g_master_wdt_timer @ gp+0x202c (0x8099ac)`,
+`master_wdt period_ms @ gp-0x7968 (0x800018)`, `master_mode flag @ gp+0x20fc`,
+`master power-state @ gp+0x2034`, `crc32 table @ gp+0x2124 (0x809aa4)`.
 
 ### 14.5 Hardware watchdog register map — `0x16600000` (startup WDT) [RE, CONFIRMED]
 
