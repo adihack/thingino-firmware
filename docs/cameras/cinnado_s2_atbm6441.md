@@ -427,6 +427,53 @@ ioctl, and a grep of the entire thingino `package/` tree finds no caller** — y
 indefinitely. Therefore this monitor is **armed by sending the frame**, and sending it from
 U-Boot would *create* a watchdog we must then feed forever. Do not use it as a feed. [RE]
 
+### 7.3b Feed experiments — measured, and why feeding is harder than it looks (2026-07-25)
+
+Method: a bare-metal test blob (`scratchpad/ubootblob/feedblob_*.c`, sharing the low-level half
+of `atbm_wdt.c`) XMODEM-loaded with `loadx 0x80600000` and started with `go`. It deliberately
+does **no** enumeration and **no** wake, reusing the link the console-entry hook already brought
+up, so it isolates one question: can U-Boot keep the watchdog fed?
+
+| Run | What the blob did | Reset (after power-on) | Where it died |
+|---|---|---|---|
+| baseline | nothing (idle at the prompt) | **56.2 s** | — |
+| A | 10 × inject `0x13`, 5 s apart, no RX drain | **65.5 s** | after feed #10 |
+| B | same, with real status printed | **74.1 s** | **hung on inject #4** |
+| C | inject + drain RX (buffer id starting at 1) | **19.3 s** | **hung inside the FIRST read** |
+
+What this establishes [LIVE]:
+
+* **Injects land without re-enumerating.** `cmd53_block()` to the force-bit TX address returned 0
+  every time from a blob that never issued CMD0. This validates the planned `link_ready` split:
+  bring the link up once, then only inject.
+* **Feeding does move the deadline** (56 s → 65 s → 74 s), so the reset is at least partly tied to
+  host activity rather than being a pure power-on timer.
+* **But inject-only feeding wedges the link.** Every `0x13` makes the device queue a `0x043A`
+  confirm. Nothing drained them and `HIF_CONTROL` read **`0x3100`** on every tick — bits 12/13 are
+  WUP|CONT_RDY and the low bits are the pending-RX length (`nl = ((ctl & 0x0FFF) |
+  ((ctl & 0xC000) >> 2)) * 2` = **512 bytes waiting**). Inject #4 then hung for ~50 s and the MCU
+  reset the SoC.
+* **Naively draining wedges it even faster.** Run C hung inside its very first
+  `cmd53_block()` read and died 6 s later. The console-entry hook's own read works, and the
+  difference is the **rotating HIF RX buffer id**: the hook consumed one frame with `bid=1` so the
+  next expected id is 2, while the blob asked for 1 again. The host must track the device's
+  expected buffer id (and, on the WSM level, the rx sequence — the same class of bug as the
+  driver-side rx-seq desync in §3.2).
+
+**Verdict [LIVE]: a correct U-Boot feed is not a one-liner.** It needs the HIF queue bookkeeping
+(buffer-id rotation + a drained RX path), i.e. a small port of the driver's bottom-half logic —
+not just a periodic `m3_frame()`. Before investing in that, note that **the chunked flash design
+does not need feeding at all**: a 1 MB chunk takes ~10 s, which fits in the ~44 s that remain at
+the prompt, and each `reset` starts a fresh window (§8.2, and the `au_os` env in the camera
+config). Linux-side updates have no watchdog constraint whatsoever, because the running driver
+already does all of this bookkeeping correctly — proven by a 10 h soak.
+
+**Unexplained contradiction [TBC]:** in one run the XMODEM transfer did not complete, `go` never
+ran, and the CPU wedged inside U-Boot's `loadx` (the console answered neither CR nor `version`).
+It then survived **200 s with no reset**. A wedged CPU cannot feed anything, so a pure
+elapsed-time deadline should have fired at ~56 s. So the ~56 s reset condition probably depends
+on SDIO/HIF state, not only on time. Do not treat ~56 s as a simple timer until this is resolved.
+
 ### 7.4 Hard-won operational rules [LIVE]
 
 * **A second `atbm wdt off` right after the first is FATAL — reset ~6 s later.** The second call
@@ -576,8 +623,8 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
 | # | Question | Why it matters |
 |---|---|---|
 | 1 | Is the ~56 s reset (§7.3) power-on-relative or last-contact-relative? | Decides whether feeding from U-Boot can work at all |
-| 2 | What actually fires at ~56 s? | Same |
-| 3 | Does an **inject-only** feed (link-up once, then bare frames) extend the window? | The whole U-Boot feed design |
+| 2 | What actually fires at ~56 s? A CPU wedged in `loadx` once survived 200 s (§7.3b), so it may not be a pure timer. | Same |
+| 3 | ~~Does an inject-only feed extend the window?~~ **ANSWERED (§7.3b):** injects land and do extend it, but inject-only wedges the link and naive draining wedges it faster — a correct feed needs HIF buffer-id/rx-seq bookkeeping. | The whole U-Boot feed design |
 | 4 | What is the ~28.6 s periodic SDIO RX in idle Linux? | May be the thing that satisfies mechanism B |
 | 5 | Can `wdt_set_period` (0x14) be given a very long period, or 0/0xFFFFFFFF for "never"? | Would be a clean one-shot fix |
 | 6 | Does a long `check_alive` period set from Linux persist across an SoC reset into U-Boot? | Would make U-Boot windows irrelevant |
