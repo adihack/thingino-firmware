@@ -387,7 +387,13 @@ Vendor arming pattern for its own app watchdog: `enable(0x12)` → `set_period(0
 `feed(0x15)` every 6 s. Our `atbm wdt on` reproduces `0x12`+`0x14(12)` and the board does reset
 (~6 s observed), so the arm path works too.
 
-### 7.3 Mechanism B — a second reset at ~56 s that we do NOT understand [TBC]
+### 7.3 Mechanism B — a second reset at ~56 s [RESOLVED 2026-07-25, see §14.4]
+
+**RESOLVED by the firmware dump (§14): this is the lp_mgr `master_wdt` host-alive timer.**
+The ATBM is the SoC power-master; `master_wdt_timer_cb` power-cycles the T23 when the host
+stops kicking it. It is controllable from the T23 over SDIO via `message_mgr` msg_id 0x12
+(STOP) / 0x13 (DELETE) / 0x14 (set period) / 0x15 (kick). The historical notes below are kept
+for the measured numbers; the mechanism they puzzle over is now identified.
 
 **Measured 2026-07-25, single variable, nothing typed after the prompt:**
 
@@ -744,8 +750,8 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
 
 | # | Question | Why it matters |
 |---|---|---|
-| 1 | ~~power-on-relative or last-contact-relative?~~ **PARTLY ANSWERED (§7.3c):** feeding triples the window (56 s -> 140-170 s), so it is activity-related, not a fixed power-on timer. The exact rule is still unknown. | Decides whether feeding from U-Boot can work at all |
-| 2 | What actually fires at ~56 s? A CPU wedged in `loadx` once survived 200 s (§7.3b), so it may not be a pure timer. | Same |
+| 1 | ~~power-on/last-contact? what fires at 56 s?~~ **ANSWERED (§14.4):** it is the lp_mgr `master_wdt` host-alive timer; the host kicks it with msg_id 0x15 or disables it with 0x12/0x13. | Was the whole U-Boot feed question |
+| 2 | Does a **properly-framed** msg_id 0x13 (DELETE master_wdt) sent from the T23 actually stop the ~56 s reset? Our earlier U-Boot 0x13 did not — likely a malformed message_mgr frame dropped on CRC. | Confirms the clean bootloader fix vs bounded-chunk fallback |
 | 3 | ~~Does an inject-only feed extend the window?~~ **ANSWERED (§7.3b/c):** yes, ~3x, once RX is drained with the correct rotating buffer id. Stops after 4 injects for lack of TX buffer-credit accounting. | The whole U-Boot feed design |
 | 4 | What is the ~28.6 s periodic SDIO RX in idle Linux? | May be the thing that satisfies mechanism B |
 | 5 | Can `wdt_set_period` (0x14) be given a very long period, or 0/0xFFFFFFFF for "never"? | Would be a clean one-shot fix |
@@ -755,7 +761,10 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
 | 9 | Does WiFi **STA** work at all on our source-built gtxaspec driver (`CONFIG_MAC80211=y`)? | Gates any LAN-based update path |
 | 10 | Is the microSD slot reachable without opening the case? | Decides whether the SD `stop.txt` recovery trigger is enough and the button is optional |
 | 11 | Does the Z7682 boot ROM validate the `mcu_fw.bin` footer checksums? | Whether MCU firmware can be repacked |
-| 12 | Exact ISA of the two ATBM cores (ARC? C-SKY?) | Only needed for deep firmware work |
+| 12 | ISA is NDS32 (§14.1) - deep-firmware convenience only | Only needed for deep firmware work |
+| 13 | Exact CRC algorithm at `message_mgr` fn `0xaa4b4` (host must reproduce it over the payload or the command is dropped). Linux vendor-driver framing already passes it. | Needed to send master_wdt commands from bare-metal U-Boot |
+| 14 | Does `master_mode=0` (msg_id 0x2b) persist across reboot and permanently stop the host-alive reboot? `gp+0x20fc` is read-only in the app image. | Cleanest one-shot fix for a mains-powered cam |
+| 15 | Does the ATBM firmware expose a WSM read-register/peek command so U-Boot can poll RST = `(0x16800020>>17)&1` directly? | Decides RST-button-at-boot feasibility |
 
 ---
 
@@ -791,3 +800,182 @@ over gtxaspec `atbm6441` @ `8cf3606`. U-Boot MCU code:
 `extracted/librtos.so`, `extracted/system/bin/mcu_test`,
 `extracted/system/mcu_fw/{mcu_fw.bin,seg1.dec,seg2.dec}` (seg2 is the interesting one —
 `grep -a` it for strings), and the stock driver `atbm6041_wifi_sdio.ko`.
+
+## 14. ATBM6441 firmware — full dump and static analysis (2026-07-25) [RE/LIVE]
+
+The ATBM6441 has its **own UART** (separate from the T23 console). On this board it exposes an
+interactive **AT command console** at 115200 8N1. Two of its commands — `AT+rmem` (read any
+address) and `AT+wmem` (write any address) — gave us the whole internal firmware. This section is
+the result. **The soldered ATBM UART is a lab instrument for THIS one camera; it is not a
+deployment channel. Everything that must ship has a T23-side (SDIO) path, called out below.**
+
+### 14.1 How the image was obtained [LIVE]
+
+* Console: `AT+HELP` lists ~180 commands. `AT+DEFAULT_DEBUG_ENABLE=0` mutes async printk so it
+  cannot corrupt a hexdump.
+* `AT+rmem=<addr_hex>,<len_dec>` dumps memory, little-endian words, **max 160 B/reply** — but a
+  reply longer than 8 lines overruns the chip's UART TX buffer and corrupts bytes, so use
+  **128 B chunks** (measured 0/40 corrupt at 128 vs 14/40 at 160).
+* The SPI-NOR of the ATBM is memory-mapped (XIP) at **`0x400000–0x5FFFFF` (2 MB)**. A resumable
+  128-B dumper (`scratchpad/at_dump2.ps1`) pulled all 2 MB in ~18 min at ~2 kB/s; verified by
+  re-reading 48 random chunks (48/48) and by a second independent dump being byte-identical.
+  `atbm_flash2.bin`, md5 `5e9e017e915eea70cf816c8b49b34a82`.
+* Firmware is **unencrypted** (`no-enc` in the boot banner). Architecture is **Andes NDS32
+  (little-endian)** — proven by the exception handler printing `IVB/PSW/IPSW/EDMSW/ITYPE`.
+  No off-the-shelf disassembler supports it (not radare2, not capstone); we built
+  **`nds32le-elf-objdump` from binutils-2.38 source** (`--target=nds32le-elf`).
+
+### 14.2 Flash and runtime address model [RE]
+
+| Flash (XIP window) | Content |
+|---|---|
+| `0x400000` | image header: magics `0x0000ab45 0x0000ab47`, then `img1@0x401000 len 0xaf00`, `img2@0x560000 len 0xaf00` = the two ~44 KB **bootloader** copies (A/B), `map 0x560000` |
+| `0x400000–0x47ffff` | main application (bootloader front + app text + rodata/strings) |
+| `0x480000–0x4fffff` | zeros |
+| `0x558000–0x5affff` | second dense image (OTA/B copy) |
+
+**Runtime link base:** the application is linked to run at a VMA where **`flash_addr = VMA +
+0x380000`** (recovered by brute-forcing the offset that makes 3542 reconstructed `sethi/ori`
+pointers land exactly on string addresses). So to disassemble the app correctly:
+```
+nds32le-elf-objdump -D -b binary -m nds32 -EL --adjust-vma=0x80000 atbm_flash2.bin
+```
+(the bootloader front is a separate blob that runs XIP at VMA `0x400000`, and there is an
+in-ROM helper region based at `0x1400000` not present in the dump). Tooling used:
+`scratchpad/nds32_analyze2.py` → `atbm_annotated.txt` (full annotated disasm, every constant
+load resolved to its string/MMIO), `atbm_xref.txt`, `atbm_mmio.txt`.
+
+### 14.3 The message_mgr command interface — THE T23 control surface [RE, CONFIRMED]
+
+The T23 host controls the ATBM by posting fixed-layout messages to the `message_mgr` task over
+SDIO/WSM. **This is the same interface as our reversed "MCU command protocol".** Dispatcher at
+VMA `0xaa956`.
+
+**Wire format** (each field a 32-bit word):
+```
+word0 = header
+word1 = msg_id           <-- the command selector
+word2 = crc              <-- CRC over the payload; message_mgr recomputes (fn 0xaa4b4) and
+word3 = length                DROPS the frame silently on mismatch ("crc(%x) error")
+payload @ byte 0x10
+```
+Dispatch: `index = msg_id - 1`, range `1..0x45`, jump table at `0xaa9d4`; out of range →
+`unsupported msg_id:0x%x`. A subset of commands translate into an **internal event**
+`0x1001..0x1032` consumed by a second dispatcher at `0xab15c` (table `0xab184`).
+
+**msg_id map (authoritative, from the jump table):**
+
+| msg_id | action |
+|---|---|
+| 0x01 | post internal event 0x1003 |
+| 0x02 / 0x04 / 0x3f | network / P2P send (ip, port, did, payload) |
+| 0x05 | cloud connect (ip, port, did, mode, code) |
+| 0x09 / 0x0a | **PIR enable / disable** |
+| 0x0b | PIR cooldown timer |
+| **0x12 (18)** | **STOP master_wdt (host-alive) timer** — no payload |
+| **0x13 (19)** | **DELETE master_wdt timer** — no payload |
+| **0x14 (20)** | **SET-PERIOD + START master_wdt** — payload word0 = period **seconds** (×1000 ms) |
+| **0x15 (21)** | **RESTART / KICK master_wdt** — the periodic keepalive |
+| 0x16 / 0x17 | set_mcu_alarm / _b |
+| 0x23 (35) | get version (`1.2.5u1`) |
+| **0x2b (43)** | **set master_mode** — payload word0 ∈ {0,1}; → internal 0x1017 → setter `0xdc638` writes WSM-context byte[0x99] and pushes it to MAC firmware |
+| 0x34 | MCU factory reset |
+| 0x37 / 0x38 | wifi stop / set static IP |
+| 0x39 / 0x3a | get / set wifi DCXO |
+| 0x3b | set RTC mode |
+| 0x3d / 0x3e / 0x45 | set / get battery params |
+| 0x40 / 0x41 | wifi start_ap / stop_ap |
+
+(msg_id 0x11 is explicitly *unsupported* — the wdt family starts at 0x12.)
+
+This cross-checks our older reversed catalog: `pir=9/10` ✓, `wdt family 18–21` ✓. **Note the
+numbering is the message_mgr msg_id, and message_mgr CRC-checks the payload before dispatch** —
+a frame with a wrong/absent CRC is dropped without error. Our working Linux GETs (version,
+battery) prove the vendor-driver framing (with correct CRC) is accepted; a hand-rolled U-Boot
+frame must reproduce the CRC (fn `0xaa4b4`, not yet byte-reversed) or it is ignored.
+
+### 14.4 RESOLVED: the "~56 s reset" is the lp_mgr master_wdt (host-alive) [RE, CONFIRMED]
+
+Supersedes the "Mechanism B — we do NOT understand" note in §7.3. The ATBM is the **power master**
+of the T23 SoC. `message_mgr` init creates `g_master_wdt_timer` (handle at `gp+0x202c`). If the
+host does not keep it kicked, the expiry callback `master_wdt_timer_cb` (VMA `0xa9ffe`, prints
+`[lp_mgr]master_wdt_timer_cb.`) posts lp_mgr event `0x16`, and the master state machine calls
+`master_power_off` / `master_power_on` (`HI_SDIO_Host_Reboot`, `host alive failed... reboot two
+devices`) — i.e. it **power-cycles the T23**. This is the reset that interrupts a long U-Boot
+flash. It is a *software* timer in this app, entirely distinct from the `0x16600000` hardware
+watchdog (§14.5) which is the ~14.5 s startup wdt and is already off during normal run.
+
+**T23-side control (field path):**
+* **Stop it:** send msg_id **0x13** (DELETE) or **0x12** (STOP) — no payload. 
+* **Or set a long period:** msg_id **0x14**, payload word0 = seconds.
+* **Or feed it:** msg_id **0x15** periodically.
+* **Or demote the ATBM:** msg_id **0x2b** payload 0 (`master_mode=0`) — tells the chip it is not
+  the power master (also flips WSM ctx byte[0x99]). Cleanest if it persists; persistence TBC.
+
+**Why our earlier U-Boot `0x13` did not stop it (§7.3):** most likely the bare-metal U-Boot frame
+was not a valid `message_mgr` message (wrong wrapper / no CRC), so `message_mgr` dropped it while
+the WSM transport still ACKed (`retcode=0`). The definitive test is to send a **properly-framed**
+msg_id 0x13 (the format the Linux driver already uses for working GETs) and confirm the reset
+stops. Until that test, treat the bounded-chunk flash (§7.x `au_os`) as the guaranteed baseline.
+
+### 14.5 Hardware watchdog register map — `0x16600000` (startup WDT) [RE, CONFIRMED]
+
+Key-protected: every control write must be immediately preceded by writing the key to `+0x18`.
+
+| Register | Meaning |
+|---|---|
+| `0x16600018` | KEY / unlock ← `0x00005AA5` (before every protected write) |
+| `0x16600010` | CONTROL, bit0 = enable (set = arm, clear = disable) |
+| `0x16600014` | FEED ← `0x0000CAFE` (kick, after key) |
+| `0x16600020 / 24` | timeout / prescaler reload |
+| `0x16600028` | current count / status (read-only) |
+| `0x16100080 ← 3`, `0x16100090` | WDT module clock gate |
+| `0x1660001c` | software-reset trigger (magics `0x5AA5`/`0xCAFE`) |
+
+In-blob driver at VMA `0xce44c–0xce57c`. To disable by raw poke: `0x16600018 ← 0x5AA5` then
+`0x16600010 ← 0` (clears enable). **Live-read confirms this wdt is idle in normal operation**
+(count `0x16600028 = 0`, control `0x03002001`, stable) — it only runs during the ~14.5 s startup
+and is what WSM opcode `0x13`/the firmware turns off. **Caveat:** `0x16600000` is on the ATBM's
+internal AHB, reachable from the T23 only through the SDIO→AHB direct-access window (the same
+bridge firmware-download uses); it is NOT a plain SDIO-addressable register.
+
+### 14.6 ATBM GPIO controller — `0x16800000` — and the RST button [RE, CONFIRMED + LIVE]
+
+The ATBM has its own GPIO controller, **internal to the NDS32 core, not visible on the SDIO bus**.
+Pin number = bit index in each 32-bit register. HAL at `0xcee30–0xcf05e`.
+
+| Register | Meaning |
+|---|---|
+| `0x16800020` | INPUT level — read a pin as `(reg >> pin) & 1` |
+| `0x16800024` | OUTPUT data (set/clr/toggle) |
+| `0x16800028` | OUTPUT-ENABLE / direction (1 = output) |
+| `0x16800034` | INPUT / interrupt-enable |
+| `0x16800050 / 54` | per-pin interrupt enable / 4-bit trigger config |
+| `0x16800064` | interrupt pending (write to clear); ISR at `0x93a16`, per-pin handler table `gp-0x795c` |
+
+**Pin assignment (live-validated on hardware):**
+
+| Pin | Function | Live read |
+|---|---|---|
+| **17** | **KEY0 = RST button**, active-low (pressed = 0) | `0x16800020` bit17 = 1 (not pressed) ✓ |
+| **16** | **PIR**, active-high | bit16 = 0 (idle) ✓ |
+| **22** | **host-wake** output to T23 | OUT-ENABLE bit22 set, OUTPUT bit22 = high ✓ |
+| 19, 25 | interrupt inputs (charge / USB / etc.) | IN/INT-EN = `0x020b0000` (16,17,19,25) ✓ |
+| 20, 21, 23 | outputs | OUT-ENABLE = `0x00f00000` (20–23) ✓ |
+
+**RST button from T23:** you **cannot** memory-map or bit-bang KEY0 from the host — pin 17 is on
+the ATBM private bus. Two routes: (1) the stock path — the ATBM GPIO ISR forwards the press as a
+WSM event indication (eventId 16, word0 bit `0x01` press / `0x02` release, per §5), which the host
+consumes; (2) IF the firmware exposes a WSM read-register/peek command, U-Boot could poll
+`(0x16800020 >> 17) & 1` directly (single 32-bit load, no credit-gate) — this is the clean
+"RST-poll at boot" and depends on such an opcode existing (open question). Floodlight / IR / status
+LEDs are **not** on this controller — they are T23 SoC GPIOs (floodlight gpio60, IR-cut 58/64,
+IR-LED 62, LEDs 49/50) and need no ATBM cooperation.
+
+### 14.7 Bricked-ATBM recovery over the same UART [RE]
+
+The ATBM bootloader (`bootloader.flashIotBoot`, banner strings `FLASH BIN received`,
+`HI_UartReceiveHandler`, `flash_page_program`, `check device id success!!` with flash-controller
+regs `0x16a00080/94/98`) has a **UART firmware-download mode**. So a mis-flashed ATBM is
+recoverable over this same UART without a chip clip — the ingredient for treating ATBM
+experiments as reversible.
