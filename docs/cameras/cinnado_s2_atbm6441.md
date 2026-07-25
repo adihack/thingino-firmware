@@ -474,6 +474,47 @@ It then survived **200 s with no reset**. A wedged CPU cannot feed anything, so 
 elapsed-time deadline should have fired at ~56 s. So the ~56 s reset condition probably depends
 on SDIO/HIF state, not only on time. Do not treat ~56 s as a simple timer until this is resolved.
 
+### 7.3c Feeding WORKS and triples the window — and exactly where it stops (2026-07-25)
+
+**A prerequisite discovered the hard way:** the power button does **not** reset the ATBM6441. The
+Z7682 is always powered (it *is* the power controller), so an SoC power-button cycle leaves the
+module's HIF queue, buffer-id rotation and WSM sequence state intact. Leftovers from one test
+therefore poison the next, which is why an earlier series appeared to degrade (10 → 3 → 0 feeds).
+**Every watchdog measurement must start from a real power cut** (pull the USB), not a button
+off/on. Runs before this was understood should be treated as unreliable.
+
+With that method fixed, and a blob that reuses the console hook's link (no CMD0), drains RX with
+the **correct continuing buffer id** (the hook consumed `bid=1`, so the blob starts at `bid=2`):
+
+| Run | Feed detail | Result |
+|---|---|---|
+| baseline | no feeding | reset **56.2 s** after power-on |
+| D | inject `0x13` + drain, same WSM seq every frame | **31 feeds, reset 171.4 s** |
+| E | same, but incrementing the WSM tx sequence | **25 feeds, reset 139.8 s** |
+
+* **Feeding from U-Boot works: the window goes from ~56 s to ~140–170 s (about 3×).** [LIVE]
+* **`bid=2` was the fix for draining.** With the right rotation each read returned `rc=0` and the
+  queue went back to empty (`ctl=0x3000`, `nl=0`); the first drained frame was even an event
+  indication (`id=0x0805`) left over from bring-up. The earlier "draining wedges the link" result
+  was purely a wrong starting buffer id. [LIVE]
+* **The WSM tx sequence is NOT the limiter.** Incrementing it (id bits 13-15, as the confirm's
+  `0xc43a` shows) changed nothing — 4 responses either way. [LIVE]
+* **Where it stops: the device answers exactly 4 injects, then goes silent** (`drained=0`,
+  `nl=0` forever) and resets us ~2 min later. That count matches the device's **input-buffer
+  credits**: the driver tracks `hw_bufs_free = wsm_caps.numInpChBufs - hw_bufs_used`, charges one
+  per TX (`++hw_bufs_used`, bh_sdio.c:670) and releases one only when a confirm arrives
+  (`wsm_release_tx_buffer()`, bh_sdio.c:120/341/344/502) — while it rotates `buf_id_tx` per frame.
+  Our blob always writes buffer id 0 with the force bit (address `0x28`). So the remaining work is
+  **TX buffer-id rotation plus credit accounting**, not anything mysterious. [STRONG_INFERENCE]
+* Note the fragility if anyone implements that: `numInpChBufs` normally comes from `STARTUP_IND`,
+  which U-Boot never receives, so the credit count would have to be assumed (4 by observation).
+
+**Practical conclusion — this is already enough for field work.** ~140–170 s comfortably covers a
+4.5 MB rootfs write (~41 s at the measured ~179 KB/s) or even all of kernel+rootfs (5.9 MB, ~55 s)
+in a single pass, and the committed chunked `au_os` (1 MB ≈ 10 s per boot) needs no feeding at all.
+Implementing full credit accounting would buy an *unbounded* window; it is a bounded, well-located
+task (bh_sdio.c) but not required for a trustworthy flash.
+
 ### 7.4 Hard-won operational rules [LIVE]
 
 * **A second `atbm wdt off` right after the first is FATAL — reset ~6 s later.** The second call
@@ -622,9 +663,9 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
 
 | # | Question | Why it matters |
 |---|---|---|
-| 1 | Is the ~56 s reset (§7.3) power-on-relative or last-contact-relative? | Decides whether feeding from U-Boot can work at all |
+| 1 | ~~power-on-relative or last-contact-relative?~~ **PARTLY ANSWERED (§7.3c):** feeding triples the window (56 s -> 140-170 s), so it is activity-related, not a fixed power-on timer. The exact rule is still unknown. | Decides whether feeding from U-Boot can work at all |
 | 2 | What actually fires at ~56 s? A CPU wedged in `loadx` once survived 200 s (§7.3b), so it may not be a pure timer. | Same |
-| 3 | ~~Does an inject-only feed extend the window?~~ **ANSWERED (§7.3b):** injects land and do extend it, but inject-only wedges the link and naive draining wedges it faster — a correct feed needs HIF buffer-id/rx-seq bookkeeping. | The whole U-Boot feed design |
+| 3 | ~~Does an inject-only feed extend the window?~~ **ANSWERED (§7.3b/c):** yes, ~3x, once RX is drained with the correct rotating buffer id. Stops after 4 injects for lack of TX buffer-credit accounting. | The whole U-Boot feed design |
 | 4 | What is the ~28.6 s periodic SDIO RX in idle Linux? | May be the thing that satisfies mechanism B |
 | 5 | Can `wdt_set_period` (0x14) be given a very long period, or 0/0xFFFFFFFF for "never"? | Would be a clean one-shot fix |
 | 6 | Does a long `check_alive` period set from Linux persist across an SoC reset into U-Boot? | Would make U-Boot windows irrelevant |
