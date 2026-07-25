@@ -1,19 +1,66 @@
 serialport=ttyS1
 
-# MCU watchdog stays ARMED on a normal boot (WDT_DISABLE=0). It is disabled ONLY inside
-# the SD-card flash sequences below, and ONLY once a valid update file is confirmed on
-# the card - so a normal boot (no card / no update file) keeps its watchdog protection.
+# MCU watchdog stays ARMED on a normal boot (WDT_DISABLE=0). Nothing here disables it
+# except the explicit flash paths below, so a normal boot keeps its watchdog protection.
 WDT_DISABLE=0
 
-# --- SD-card recovery, two modes selected by the file name on the FAT card ----------
-# au_os   : autoupdate-os.bin   -> flash OS ONLY (kernel+rootfs+data, 0x60000..end);
-#           bootloader (0x0..0x60000) never touched -> an interrupted flash is retryable,
-#           not a brick. SAFE default. RAM src = loadaddr(0x80600000)+0x60000 = 0x80660000.
-# au_full : autoupdate-full.bin -> whole chip incl. U-Boot (deliberate; keep CH341A handy).
-# In BOTH: the Z7682 MCU watchdog is disabled ('atbm wdt off') only AFTER fatsize confirms
-# the file exists (the full-chip erase takes minutes, longer than the ~14.5s wdt) - if the
-# file is absent, the wdt is left armed.
-# autoupdate (run by bootcmd) tries au_os first (safe), then au_full. Same image, name picks mode.
-au_os=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-os.done; then echo "AU: os already applied"; else if fatsize mmc 0:1 autoupdate-os.bin; then echo "AU: os update found; disabling MCU wdt for the flash"; atbm wdt off; if fatload mmc 0:1 ${loadaddr} autoupdate-os.bin; then echo "AU: flashing OS only (U-Boot preserved)"; if sf probe && sf erase 0x60000 0xfa0000 && sf write 0x80660000 0x60000 0xfa0000; then fatwrite mmc 0:1 ${loadaddr} autoupdate-os.done 1; echo "AU: os done, rebooting"; reset; fi; fi; fi; fi; fi
-au_full=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-full.done; then echo "AU: full already applied"; else if fatsize mmc 0:1 autoupdate-full.bin; then echo "AU: full update found; disabling MCU wdt for the flash"; atbm wdt off; if fatload mmc 0:1 ${loadaddr} autoupdate-full.bin; then echo "AU: flashing FULL chip (incl U-Boot)"; if sf probe && sf erase 0 ${flash_len} && sf write ${loadaddr} 0 ${filesize}; then fatwrite mmc 0:1 ${loadaddr} autoupdate-full.done 1; echo "AU: full done, rebooting"; reset; fi; fi; fi; fi; fi
-autoupdate=run au_os; run au_full
+# ============================ SD-card field recovery =================================
+# Hard-won constraints this design obeys (see MORNING_2026-07-25.md + memory):
+#  * The Z7682 MCU runs TWO watchdogs. 'atbm wdt off' (MCU cmd 0x13) truly kills the
+#    ~14.5s startup one, but a second ~60s "host-alive" watchdog CANNOT be disabled -
+#    only fed. In U-Boot nothing feeds it, so we get ONE ~60s window per boot.
+#  * Measured SPI-NOR erase is ~179 KB/s. So any single 'sf erase' bigger than ~5 MB
+#    is cut in half by the MCU reset. A 1 MB chunk is ~10s: it fits even inside the
+#    UNDISABLED 14.5s window, which is why this survives even if 'atbm wdt off' fails.
+#  * NEVER pass len == flash size to 'sf erase': that takes U-Boot's chip-erase branch
+#    (spi-nor-core.c, 'len == mtd->size' -> spi_nor_erase_chip), whose status poll has
+#    no schedule() and runs up to 320s. The MCU then resets us with the chip ALREADY
+#    BLANK = a real brick recoverable only with a CH341A.
+#  * NEVER erase 0x0..0x60000 (boot+env) in the field. Then every interruption is
+#    retryable rather than fatal.
+#
+# au_stop : card holds 'stop.txt'      -> park at the U-Boot prompt (field recovery, no
+#                                         button and no case opening needed).
+# au_os   : card holds 'autoupdate-os.bin' (a full 16MB image; only the region above the
+#           bootloader is used) -> flash kernel+rootfs in 1 MB chunks, ONE CHUNK PER BOOT,
+#           progress marked by auN.done files ON THE CARD, so an interruption RESUMES
+#           instead of restarting. Leaves 'data' (overlay/config) intact, so a field
+#           update keeps the WiFi credentials and password.
+# NOTE: au_os is NOT in the automatic chain yet - it is pending live validation of the
+#       hush loop. Flip 'autoupdate' to 'run au_stop; run au_os' once validated.
+
+au_stop=if fatsize mmc 0:1 stop.txt; then echo "SD: stop.txt -> parking at U-Boot prompt"; atbm wdt off; setenv bootdelay -1; fi
+
+# one chunk: co=flash offset, cl=length, cm=marker file. Ends with 'reset' so each boot
+# gets a fresh watchdog window; the next boot skips this chunk via its marker.
+au_do=atbm wdt off; mmc rescan; if fatload mmc 0:1 ${loadaddr} ${aufile} ${cl} ${co}; then sf probe; if sf erase ${co} ${cl} && sf write ${loadaddr} ${co} ${cl}; then fatwrite mmc 0:1 ${loadaddr} ${cm} 1; echo "AU: ${cm} written -> reset"; reset; else echo "AU: ${cm} FAILED - will retry next boot"; fi; else echo "AU: fatload ${cm} failed"; fi
+
+au_c1=if fatsize mmc 0:1 au1.done; then echo "AU: au1 done"; else setenv co 0x60000; setenv cl 0x100000; setenv cm au1.done; run au_do; fi
+au_c2=if fatsize mmc 0:1 au2.done; then echo "AU: au2 done"; else setenv co 0x160000; setenv cl 0x100000; setenv cm au2.done; run au_do; fi
+au_c3=if fatsize mmc 0:1 au3.done; then echo "AU: au3 done"; else setenv co 0x260000; setenv cl 0x100000; setenv cm au3.done; run au_do; fi
+au_c4=if fatsize mmc 0:1 au4.done; then echo "AU: au4 done"; else setenv co 0x360000; setenv cl 0x100000; setenv cm au4.done; run au_do; fi
+au_c5=if fatsize mmc 0:1 au5.done; then echo "AU: au5 done"; else setenv co 0x460000; setenv cl 0x100000; setenv cm au5.done; run au_do; fi
+au_c6=if fatsize mmc 0:1 au6.done; then echo "AU: au6 done"; else setenv co 0x560000; setenv cl 0xe0000; setenv cm au6.done; run au_do; fi
+
+# kernel 0x60000..0x1C0000 + rootfs 0x1C0000..0x640000 = 0x60000..0x640000 (5.875 MB)
+au_os=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-os.done; then echo "AU: os already applied"; else if fatsize mmc 0:1 autoupdate-os.bin; then setenv aufile autoupdate-os.bin; run au_c1; run au_c2; run au_c3; run au_c4; run au_c5; run au_c6; fatwrite mmc 0:1 ${loadaddr} autoupdate-os.done 1; echo "AU: OS update complete"; fi; fi; fi
+
+# Overlay/config wipe, chunked (data = 0x640000 + 0x9C0000 = 9.75 MB; a single erase
+# would blow past the 60s window). Manual: 'run overlay_wipe'.
+# HONEST CAVEAT: 3 x 3.25 MB is ~57s of erase, so this only completes if the interleaved
+# 'atbm wdt off' really re-feeds the host-alive timer - which is NOT yet verified. The
+# RELIABLE way to wipe the overlay is from Linux ('flash_erase /dev/mtd4 0 0'), because a
+# running Linux keeps the MCU fed indefinitely. Treat this as best-effort.
+overlay_wipe=atbm wdt off; sf probe; sf erase 0x640000 0x340000; atbm wdt off; sf erase 0x980000 0x340000; atbm wdt off; sf erase 0xcc0000 0x340000; echo "overlay wiped"; reset
+
+# BENCH ONLY - writes the bootloader, so an interruption needs a CH341A. Never put
+# 'autoupdate-full.bin' on a field card and never add this to 'autoupdate'.
+# The erase is deliberately split so it can NEVER hit the un-fed chip-erase path.
+# HONEST CAVEAT: 0xff0000 is ~93s of erase, i.e. LONGER than the ~60s window, so as
+# written this will most likely be cut by the MCU and leave the chip blank - exactly the
+# case where you need the CH341A. It becomes usable only once the U-Boot cyclic MCU feed
+# exists. For a full-chip write today, prefer the CH341A directly.
+au_full_bench=if fatsize mmc 0:1 autoupdate-full.bin; then echo "AU: FULL chip flash (bench!)"; atbm wdt off; mmc rescan; if fatload mmc 0:1 ${loadaddr} autoupdate-full.bin; then sf probe; if sf erase 0 0xff0000 && sf erase 0xff0000 0x10000 && sf write ${loadaddr} 0 ${filesize}; then echo "AU: full done, rebooting"; reset; fi; fi; fi
+
+# Only the safe park runs automatically. au_os joins once its hush loop is validated live.
+autoupdate=run au_stop
