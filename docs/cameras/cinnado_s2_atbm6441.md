@@ -894,6 +894,8 @@ a frame with a wrong/absent CRC is dropped without error. Our working Linux GETs
 battery) prove the vendor-driver framing (with correct CRC) is accepted; a hand-rolled U-Boot
 frame must reproduce the CRC (fn `0xaa4b4`, not yet byte-reversed) or it is ignored.
 
+> **DEFINITIVE ANSWER in §14.4c below: the ~56 s reset is an ATBM WiFi-scan CRASH, not any watchdog.** 14.4/14.4b remain valid (they rule out the master_wdt and give the CRC), but 14.4c is the actual mechanism.
+
 ### 14.4 The master_wdt is DORMANT — it is NOT the ~56 s reset [LIVE 2026-07-25, CORRECTS an earlier claim]
 
 An earlier version of this section claimed the ~56 s idle-U-Boot reset **is** the lp_mgr
@@ -979,6 +981,78 @@ Two practical points:
 Useful gp-relative globals: `g_master_wdt_timer @ gp+0x202c (0x8099ac)`,
 `master_wdt period_ms @ gp-0x7968 (0x800018)`, `master_mode flag @ gp+0x20fc`,
 `master power-state @ gp+0x2034`, `crc32 table @ gp+0x2124 (0x809aa4)`.
+
+### 14.4c THE ~56 s reset, finally identified: an ATBM WiFi-scan CRASH [LIVE 2026-07-25, CORRECTS 14.4/7.3]
+
+Every earlier theory (master_wdt, check_alive host-alive, HIF wdt) was wrong. We captured the
+**ATBM's own debug console at the instant it resets the T23**, and the mechanism is an ATBM
+firmware crash, not any watchdog on the host. Exact chain from the dual-console log:
+
+```
+ATBM boots STA mode with no valid AP (bssid=NULL ssid_len=0)
+   ↓  repeatedly scans/reconnects: "sta_reconnect_config scan_cnt 2,3,…25" / "WiFi: connect failed"
+~55 s  Assert LMACtoUMAC_ScanComplete ErrCode 3        ← firmware bug in the scan-complete path
+   ↓  ERROR: OS_Exception 7 (General Exception, PC 0x3f6b6) — firmware wedges in the crash handler
+~2 s   ERROR: OS_Exception 2019 / "Hardware WDT Exception"  ← the 0x16600000 wdt fires (no longer fed)
+   ↓  "?flashstatus / bootloader.flashIotBoot"          ← the ATBM reboots ITSELF
+   ↓  "######## WDT 1 0 / WDT reset OK"
+   ↓  ATBM re-init: master_set_status(2) → "master_power_on."
+   →  the T23 is power-cycled → "T23 TPL"
+```
+
+The T23 reset is **collateral damage from the ATBM crashing and rebooting** (the ATBM is the SoC
+power-master, so its re-init power-cycles the host). One captured crash → exactly one T23 reset.
+
+This finally explains every prior observation:
+- **Idle U-Boot dies at ~56 s** — the ATBM scan-crashes on its own timeline; host state is irrelevant.
+- **Linux "survives"** — a successful boot ends in **AP mode** (`thinginoAP` SoftAP); AP mode has no
+  STA scan loop, so no assert, no crash.
+- **"Feeding extended it" (§7.3)** — SDIO traffic perturbed the scan cadence, delaying the crash.
+- **Neither master_wdt nor check_alive was armed** — correct, because neither was ever the cause.
+- **It wasn't in the app disasm** — the crash PC `0x3f6b6` and the assert are in the **LMAC/MAC
+  firmware** (runtime `0x30000`, from flash `0x410000`), outside the app link base (`0x80000`). The
+  assert string `LMACtoUMAC_ScanComplete` is at `0xef500` and appears in the crash call-trace.
+
+It is also a **field reliability risk**, not just a flashing nuisance: any camera whose configured
+AP becomes unreachable will fall into the same STA-scan → ~56 s crash → reboot loop. And normal boot
+is a **race** — Linux must reconfigure the ATBM (AP mode / stop scan) within ~55 s of ATBM power-up
+or the ATBM crashes mid-boot and resets the T23 (observed: a slow first boot got reset at ~99 s).
+
+### 14.4d Fixing it — T23-only [LIVE 2026-07-25]
+
+Root cause = the ATBM auto-connecting STA on boot. What the live experiments established:
+
+* **The boot STA-connect IS config-gated** — not truly hardcoded (the user was right to push on this).
+  `fw_atbmwifi_init` calls the connect at `0xa3742`; the gate at `0xa385a` is
+  `lbi $r1,[$r10+0x6b]; beqz38 $r1,skip` — if that config byte is 0, the STA connect is skipped
+  entirely. But the persistent knob is **not reachable except via the ATBM UART (lab-only)**:
+  - `AT+WIFI_SET_MODE=AP_MODE` is **runtime-only** — its "save" (`0xcdc8c`) writes RF register
+    `0x16101030`, not flash. Live-proven: after setting it, the next boot still scanned STA.
+  - `wifi_off` is battery-management-driven (`0xaa7fa`), not a user setting.
+  - `WIFI_JOIN_AP_AUTO` takes an SSID (it *adds* an AP to join, doesn't disable joining).
+  - The real config lives in ATBM NVRAM (sectors `0x500000`/`0x502000` = AP profile, IP
+    `192.168.43.1`, `thinginoAP`, encrypted PSK; small items at `0x504000`/`0x505000`). The
+    STA-profile slot (`+0x50`) is empty yet still triggers STA-connect. Writing this needs the ATBM
+    UART or reversing the vendor SDIO provisioning-persist path — **not deployable as-is.**
+
+* **The T23 already fixes NORMAL boot.** The Linux SoftAP bring-up (`atbm_softap.c` over
+  `/dev/atbm_ioctl`: `CLEAR_WIFI_CFG`=nr36 → `WIFI_MODE=AP`=nr7 → `SET_COUNTRY` → `WIFI_CHANNEL` →
+  `AP_CFG`) stops the STA scan at ~72 s — before the ~105 s crash. Live-confirmed: one boot, no
+  crash. So the camera is already stable in normal operation via a **T23-side** action.
+
+* **The only gap is idle U-Boot during a recovery flash** (no Linux → nothing stops the scan). The
+  deployable, T23-only fix: **U-Boot sends the same stop-scan command over SDIO before the flash.**
+  - `WIFI_MODE=AP` is the *proven* command (it stabilises every boot). It rides the WEXT/WSM path the
+    driver uses (`/dev/atbm_ioctl` nr 7).
+  - `msg_id 0x37` (`SPICMD_SET_WIFI_STOP` → internal `0x1023` → `0xace0c`) is the simpler message_mgr
+    general-cmd path U-Boot can already frame (CRC reversed, §14.4b) — pending a check that it halts
+    the STA scan, not just the AP.
+  - Zero-ATBM-interaction fallback: **bounded-chunk flash** (`au_os`, each `sf` op < the ~56 s floor,
+    `reset` between chunks). Immune to the crash, needs no SDIO from U-Boot.
+
+**Bottom line:** the ~56 s reset is fully explained (ATBM scan-crash), normal boot is already stable
+via the T23 driver, and the recovery-flash gap is closed T23-only by having U-Boot issue the
+driver's proven stop-scan over SDIO (or by bounded-chunk flashing).
 
 ### 14.5 Hardware watchdog register map — `0x16600000` (startup WDT) [RE, CONFIRMED]
 
