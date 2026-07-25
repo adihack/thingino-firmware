@@ -515,6 +515,87 @@ in a single pass, and the committed chunked `au_os` (1 MB ≈ 10 s per boot) nee
 Implementing full credit accounting would buy an *unbounded* window; it is a bounded, well-located
 task (bh_sdio.c) but not required for a trustworthy flash.
 
+### 7.3d The actual bug in our feeder, and two more ruled-out ideas (2026-07-25)
+
+Continued experiments (each after a real power cut). Two more hypotheses died, and then a
+re-read of the raw logs found the real defect — in our own code, not in the protocol.
+
+| # | Change under test | Result |
+|---|---|---|
+| E | incrementing the WSM tx sequence (id bits 13-15) | reset 139.8 s — no effect |
+| F | rotating the 6-bit TX `buf_id` per frame, as `hwio_sdio.c:344-355` does | reset 139.7 s — no effect |
+| G | the vendor's real host-alive frame, WSM `0x003C` `{status, 1212, period=600, tmo_cnt=2}` | reset 108.6 s — no effect |
+| H | full WSM startup handshake: halt+restart the WiFi core via `CONFIG` `CPU_RESET` | **kills the link**, see below |
+
+**H, the STARTUP_IND handshake, does NOT work from U-Boot [LIVE].** The driver restarts the WiFi
+CPU on every module load and that is what makes the firmware emit `WSM_STARTUP_IND (0x0801)`
+carrying `numInpChBufs` (`atbm_before_load_firmware` sets `CONFIG |= CPU_RESET|ACCESS_MODE`,
+hwio_sdio.c:1105; `atbm_after_load_firmware` then `|= IRQ_RDY(BIT16|BIT17)`, `&= ~CPU_RESET`
+— comment *"clear cpu reset, cpu will run"* — `&= ~CLEAR_INT`, hwio_sdio.c:1216-1220; `main.c:624`
+waits for `firmwareReady`, set only by `wsm_startup_indication()`; the count is the first u16 of
+the body, wsm.c:617). Reproducing that sequence from U-Boot writes cleanly (`CONFIG` went
+`0x04001200` → `0x04031200`, IRQ_RDY set) but **no indication ever arrives and the board resets
+~6 s later** — the same signature as issuing a second link-up. Restarting the WiFi core from
+U-Boot leaves it dead, presumably because on HERA the image sits in TCM and only the driver's
+full sequence brings it up from its entry point. So a fresh credit count is not obtainable here.
+
+**THE REAL DEFECT (found by re-reading the logs, not by theorising) [VERIFIED in our own code]:
+every HIF output-queue read we ever issued was 256 bytes short.** `HIF_CONTROL` reported `0x3100`
+on every read, i.e. `next_len = 512`; the driver-correct transfer is `round_up(512+2, 256) = 768`.
+But both readers clamped it:
+
+```c
+alloc = (nl + 2 + 255) & ~255u;  if (alloc > 512) alloc = 512;   /* WRONG */
+static u8 b[512];
+```
+(`atbm_wdt.c` `m3_read_confirm()` and the test blob's `drain_rx()`.)
+
+The tell-tale was in the logs all along and was missed: reads #2, #3 and #4 returned
+**`id=0x00000000`** while `HIF_CONTROL` still claimed 512 bytes pending — the stream was already
+desynchronised immediately after the FIRST short read. Four short reads leave four output buffers
+un-released, and the output ring is exactly 4 deep (`buf_id_rx & 3`, read id = `buf_id_rx + 1`,
+i.e. 1..4 — the only "4" in this protocol), after which the device goes permanently silent. That
+also explains why TX never looked broken: every inject returned `rc = 0` and the reset still moved
+out to 139-171 s. **The limit correlated with READS, not injects** — and the pre-drain read, which
+happens before any inject at all, is one of the four.
+
+Confidence: the buffer-release semantics live in firmware we do not have, so this is a strong
+INFERENCE rather than a proof — but it is the only explanation consistent with all of: correct
+rx-id phase, `id=0` on reads 2-4, TX still succeeding, and the count being exactly 4.
+
+**…but fixing it did NOT help either [LIVE].** Tested in isolation (full-length reads, 2048 B
+buffer, no handshake): reset at **55.9 s** — i.e. exactly the do-nothing baseline — and the reads
+*still* returned `id=0x00000000`. So the short read was a genuine defect worth fixing, but it is
+not what limits the feed.
+
+### 7.3e Bottom line after nine experiments: we could not make the feed sustainable [LIVE]
+
+| Variant | Reset, after power-on |
+|---|---|
+| idle, no feeding (baseline) | 56.2 s |
+| full-length RX reads, isolated | **55.9 s** |
+| inject `0x13`, no drain | 65.5 / 74.1 s |
+| inject `0x13` + drain (simplest working blob) | **171.4 s** |
+| + WSM tx-sequence increment | 139.8 s |
+| + rotating 6-bit TX `buf_id` | 139.7 s |
+| vendor host-alive frame WSM `0x003C` | 108.6 s |
+| WSM startup handshake (CPU_RESET restart) | 19.8 s (kills the link) |
+
+**The results do not correlate with protocol correctness.** The best result came from the
+*simplest* blob and every subsequent "more correct" variant did the same or worse; the spread
+(56–171 s) tracks something we are not controlling. The reasonable reading is that SDIO bus
+activity perturbs the deadline, and that none of our frames are being accepted as a keepalive —
+consistent with the device never having granted us credits (no STARTUP_IND, and no way to obtain
+one from U-Boot, per H above).
+
+**Engineering conclusion: do not build the bootloader around a feed.** Make every flash operation
+fit the window that is guaranteed without one. A 1 MB chunk is ~10 s against a 56 s floor, and
+`reset` between chunks restarts the window — that is the committed `au_os` design, and it depends
+on none of the unknowns above. Linux remains unaffected (10 h soak, one `0x13` at boot).
+
+Anything further here should start by explaining the 56→171 s spread, because until that is
+understood no feed result is interpretable.
+
 ### 7.4 Hard-won operational rules [LIVE]
 
 * **A second `atbm wdt off` right after the first is FATAL — reset ~6 s later.** The second call
