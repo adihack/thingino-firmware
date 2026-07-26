@@ -12,7 +12,7 @@ new file mode 100755
 index 0000000..1111111
 --- /dev/null
 +++ b/board/ingenic/isvp-t23/atbm_wdt.c
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,574 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
@@ -289,20 +289,64 @@ index 0000000..1111111
 + * Frame layout: flag@0, len@4, id@6, magic@8, cmd@12, crc@16, retcode@20,
 + *               payload_len@24, data[512]@28.
 + */
-+static void m3_frame(u8 cmd, u32 payload_word, int payload_len)
++/* ATBM message_mgr CRC-32: reflected poly 0xEDB88320, init 0xFFFFFFFF, NO final
++ * inversion (=> crc32(empty)=0xFFFFFFFF). Computed over the `paylen` payload bytes. */
++static u32 atbm_crc32(const u8 *p, int n)
++{
++	u32 c = 0xFFFFFFFFu; int i, k;
++	for (i = 0; i < n; i++) {
++		c ^= (u32)p[i];
++		for (k = 0; k < 8; k++)
++			c = (c >> 1) ^ ((c & 1) ? 0xEDB88320u : 0u);
++	}
++	return c;
++}
++
++/*
++ * Build + inject one message_mgr frame (WSM general-cmd 0x003A) carrying an MCU
++ * msg_id + arbitrary payload, with the CORRECT layout the firmware dispatcher
++ * (0xaa954) expects. Message starts at frame offset 8:
++ *   magic@8  msg_id@12  crc32@16  len@20  payload@24
++ * The dispatcher CRC-checks crc32(payload,len) at 0xaa97e and REJECTS a bad CRC,
++ * so a non-empty payload MUST carry the real CRC. (The old m3_frame hardcoded
++ * crc=0xFFFFFFFF and mis-placed len/payload -> only empty payloads ever worked.)
++ */
++/* host->device SDIO write: FORCE bit (bypass the ready-handshake) + cycle buf_id
++ * so each frame lands in a FRESH boot-armed input descriptor. The force path with
++ * a FIXED buf_id 0 only ever delivers ONE frame (2nd = "Rx No Descriptor"); the
++ * device advertised numInpChBufs=24 armed descriptors, so cycling buf_id lets us
++ * send several. tx_seq (3-bit) folded into the WSM id per the driver. */
++static u8 m3_bufid = 0;
++static u8 m3_txseq = 0;
++static void m3_msg(u8 cmd, const u8 *payload, int paylen)
 +{
 +	static u8 f[768];
 +	volatile u32 *fw = (volatile u32 *)f;
-+	int i;
++	int i; u32 wid;
++	if (paylen < 0) paylen = 0;
++	if (paylen > 500) paylen = 500;
 +	for (i = 0; i < 192; i++) fw[i] = 0;
-+	fw[0] = 0x1E00021Cu;   /* flag: len(0x021C) low16 + carry-checksum 0x1E high byte */
-+	fw[1] = 0x003A021Cu;   /* len=0x021C @4, WSM id=0x003A @6 */
-+	fw[2] = 0xACACCACAu;   /* vendor magic @8 */
-+	fw[3] = (u32)cmd;      /* MCU cmd @12 */
-+	fw[4] = 0xFFFFFFFFu;   /* crc @16 */
-+	fw[6] = (u32)payload_len;             /* payload_len @24 */
-+	if (payload_len) fw[7] = payload_word; /* data @28 (LE arg) */
-+	cmd53_block(1, HIF_QUEUE_FORCE, f, 768);   /* force-bit inject: FW accepts regardless of seq */
++	wid = 0x003Au | ((u32)(m3_txseq & 7) << 13);   /* WSM id 0x003A | (seq<<13) */
++	fw[0] = 0x1E00021Cu;                 /* SDIO flag (len 0x021C + carry checksum) */
++	fw[1] = 0x0000021Cu | (wid << 16);   /* WSM len@4 + WSM id@6 */
++	fw[2] = 0xACACCACAu;   /* magic @8 */
++	fw[3] = (u32)cmd;      /* msg_id @12 */
++	fw[5] = (u32)paylen;   /* msg len @20 */
++	for (i = 0; i < paylen; i++) f[24 + i] = payload[i];   /* payload @24 */
++	fw[4] = atbm_crc32(payload, paylen);                   /* crc @16 */
++	/* addr = (buf_id<<6) | force(0x20) | reg0x08 ; HIF_QUEUE_FORCE already = buf0|force|0x08 */
++	cmd53_block(1, ((u32)(m3_bufid & 0x3f) << 6) | HIF_QUEUE_FORCE, f, 768);
++	m3_bufid = (u8)((m3_bufid + 1) & 0x3f);
++	m3_txseq = (u8)((m3_txseq + 1) & 7);
++}
++
++/* thin wrapper: 0- or 4-byte LE word payload (existing wdt/etc. opcodes). */
++static void m3_frame(u8 cmd, u32 payload_word, int payload_len)
++{
++	u8 pl[4];
++	pl[0] = payload_word & 0xff; pl[1] = (payload_word >> 8) & 0xff;
++	pl[2] = (payload_word >> 16) & 0xff; pl[3] = (payload_word >> 24) & 0xff;
++	m3_msg(cmd, pl, payload_len);
 +}
 +
 +/* MCU watchdog opcodes (from mcu_test/lpmgr reverse). */
@@ -310,6 +354,7 @@ index 0000000..1111111
 +#define MCU_WDT_DISABLE    0x13   /* no arg */
 +#define MCU_WDT_SET_PERIOD 0x14   /* 4-byte LE seconds; THIS starts the countdown-to-reset */
 +#define MCU_WDT_PERIOD_S   12     /* vendor lpmgr uses 12 s (fed every 6 s) */
++#define MCU_SET_MASTER_MODE 0x2b   /* arg=0 halts STA scan/reconnect (the ~56s scan-crash fix, LIVE-verified) */
 +
 +/*
 + * Drain a few RX frames looking for the 0x043A general-cmd confirm.
@@ -367,6 +412,46 @@ index 0000000..1111111
 +	return 0;
 +}
 +
++/* Link-state so console-entry's single link-up can be reused by later
++ * `atbm wsm` commands (a 2nd atbm_link_up() would CMD0 the live card = fatal). */
++static int atbm_linked = 0;
++static int atbm_ensure_linked(void)
++{
++	if (atbm_linked) return 0;
++	if (atbm_link_up()) return -1;
++	atbm_linked = 1;
++	return 0;
++}
++
++/*
++ * Build + inject one RAW WSM command frame (arbitrary id + payload). This is the
++ * SAME SDIO/WSM transport as the 0x003A general-cmd (proven working), so it
++ * reaches the ATBM WiFi firmware's WSM dispatcher directly.
++ * Header is 8 bytes: flag@0, len@4, id@6; payload@8. len = 8 + paylen.
++ * flag = len | (len-checksum << 24)  (matches driver bh_sdio.c). SDIO transfer
++ * is block-rounded to 256. Used to find the stop-scan command, e.g.:
++ *   0x000D wifimode        payload 00 00 00 00 01 00 00 00  (is_ap=1)
++ *   0x0036 auto_reconnect  payload 00 00 00 00 00 00 00 00  (disable)
++ *   0x002C clear_wifi_cfg / 0x0026 fw_sleep  payload 00 00 00 00
++ */
++static void m3_wsm_raw(u16 id, const u8 *payload, int paylen)
++{
++	static u8 f[768];
++	int i, txlen, total, lo, hi, sum, chk;
++	for (i = 0; i < 768; i++) f[i] = 0;
++	txlen = 8 + paylen;
++	lo = txlen & 0xff; hi = (txlen >> 8) & 0xff; sum = lo + hi;
++	chk = (sum & 0x100) ? ((sum + 1) & 0xff) : (sum & 0xff);
++	f[0] = (u8)lo; f[1] = (u8)hi; f[2] = 0; f[3] = (u8)chk;   /* flag */
++	f[4] = (u8)lo; f[5] = (u8)hi;                              /* len  */
++	f[6] = (u8)(id & 0xff); f[7] = (u8)((id >> 8) & 0xff);     /* id   */
++	for (i = 0; i < paylen && i < 512; i++) f[8 + i] = payload[i];
++	total = txlen; if (total < 16) total = 16;
++	if (total % 256) { total -= (total % 256); total += 256; }
++	if (total > 768) total = 768;
++	cmd53_block(1, HIF_QUEUE_FORCE, f, total);
++}
++
 +/*
 + * Fire one raw MCU opcode (+ optional 4-byte LE arg) and report the confirm.
 + * Used by the `atbm mcu` probe command. Each call re-establishes the SDIO
@@ -375,7 +460,7 @@ index 0000000..1111111
 +int atbm_mcu_cmd(u8 cmd, u32 arg, int arglen)
 +{
 +	int rc;
-+	if (atbm_link_up()) return -1;
++	if (atbm_ensure_linked()) return -1;
 +	m3_frame(cmd, arg, arglen);
 +	mdelay(5);
 +	rc = m3_read_confirm();
@@ -418,8 +503,20 @@ index 0000000..1111111
 + */
 +void atbm_wdt_console_entry(void)
 +{
-+	printf("atbm: entering U-Boot console -> disabling Z7682 MCU watchdog\n");
-+	atbm_wdt_set(0);
++	printf("atbm: recovery console -> MCU wdt off + stop WiFi scan (start_ap)\n");
++	/* Two force-bit injects to CYCLED buf_ids (0,1) -> two fresh input descriptors:
++	 *   0x13 = MCU watchdog disable (kills the ~14s MCU-wdt reset).
++	 *   0x40 = wifi_start_ap "s2": flips the scanning STA vif to AP so the reconnect
++	 *          tick stops (no LMACtoUMAC_ScanComplete assert -> no ~26-40s scan-crash).
++	 * LIVE-verified: 0x40 reaches the MCU (message_mgr wifi_start_ap:s2 -> bcreate_ap
++	 * ssid:s2). Both must land or the un-killed reset still fires. */
++	if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return; }
++	m3_frame(MCU_WDT_DISABLE, 0, 0);       /* buf_id0: wdt off */
++	mdelay(5);
++	m3_msg(0x40, (const u8 *)"s2", 2);     /* buf_id1: start_ap -> stop scan */
++	mdelay(30);
++	(void)m3_read_confirm();
++	printf("atbm: MCU wdt off + start_ap(s2). Idle U-Boot should be crash-proof.\n");
 +}
 +
 +#if defined(CONFIG_CMD_ATBM)
@@ -446,13 +543,49 @@ index 0000000..1111111
 +		return CMD_RET_SUCCESS;
 +	}
 +
++	/* atbm wsm <id_hex> [byte_hex ...] : inject a RAW WSM command (id + payload)
++	 * over the SAME transport as the MCU general-cmd. Reuses the console-entry
++	 * SDIO link (no fatal re-link). For finding the stop-scan command:
++	 *   atbm wsm d  00 00 00 00 01 00 00 00   wifimode is_ap=1 (STA->AP)
++	 *   atbm wsm 36 00 00 00 00 00 00 00 00   auto_reconnect disable
++	 *   atbm wsm 2c 00 00 00 00               clear_wifi_config
++	 *   atbm wsm 26 00 00 00 00               fw_sleep */
++	if (argc >= 3 && !strcmp(argv[1], "wsm")) {
++		u16 id = (u16)simple_strtoul(argv[2], NULL, 16);
++		u8 pl[64]; int n = 0, i;
++		for (i = 3; i < argc && n < (int)sizeof(pl); i++)
++			pl[n++] = (u8)simple_strtoul(argv[i], NULL, 16);
++		if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return CMD_RET_FAILURE; }
++		printf("atbm: inject WSM id=0x%04x paylen=%d\n", id, n);
++		m3_wsm_raw(id, pl, n);
++		mdelay(20);
++		return CMD_RET_SUCCESS;
++	}
++
++	/* atbm ap <ssid> : plane-B msg_id 0x40 (wifi_start_ap) with SSID payload + real
++	 * CRC-32. Switches ATBM STA->AP (deauths STA) -> stops the boot scan/reconnect
++	 * loop (the ~56s scan-crash). SSID 1..32 chars. */
++	if (argc >= 3 && !strcmp(argv[1], "ap")) {
++		const char *ssid = argv[2];
++		int n = (int)strlen(ssid);
++		if (n < 1) n = 1;
++		if (n > 32) n = 32;
++		if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return CMD_RET_FAILURE; }
++		printf("atbm: start_ap (0x40) ssid='%s' len=%d\n", ssid, n);
++		m3_msg(0x40, (const u8 *)ssid, n);
++		mdelay(20);
++		(void)m3_read_confirm();
++		return CMD_RET_SUCCESS;
++	}
++
 +	return CMD_RET_USAGE;
 +}
 +
-+U_BOOT_CMD(atbm, 4, 0, do_atbm,
++U_BOOT_CMD(atbm, 16, 0, do_atbm,
 +	"ATBM6441 / Z7682 MCU control",
 +	"wdt on|off        - enable(0x12+0x14)/disable(0x13) the Z7682 MCU watchdog\n"
-+	"atbm mcu <c> [a]  - fire raw MCU opcode c (hex) with optional 4B arg a (hex)");
++	"atbm mcu <c> [a]  - fire raw MCU opcode c (hex) with optional 4B arg a (hex)\n"
++	"atbm wsm <id> [b..] - inject raw WSM cmd id (hex) + payload bytes (hex)");
 +#endif /* CONFIG_CMD_ATBM */
 diff --git a/board/ingenic/isvp-t23/isvp-t23.c b/board/ingenic/isvp-t23/isvp-t23.c
 index 233ed88..ae95486 100644
