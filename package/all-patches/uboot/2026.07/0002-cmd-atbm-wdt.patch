@@ -12,7 +12,7 @@ new file mode 100755
 index 0000000..1111111
 --- /dev/null
 +++ b/board/ingenic/isvp-t23/atbm_wdt.c
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,622 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
@@ -357,47 +357,64 @@ index 0000000..1111111
 +#define MCU_SET_MASTER_MODE 0x2b   /* arg=0 halts STA scan/reconnect (the ~56s scan-crash fix, LIVE-verified) */
 +
 +/*
-+ * Drain a few RX frames looking for the 0x043A general-cmd confirm.
-+ * Returns the MCU retcode (0 = OK) or -1 if no confirm was seen.
++ * host RX (device->host) output-ring drain. Reading a COMPLETED output frame is
++ * what makes the fw run its output-completion handler (c49bc), whose sole job is
++ * to re-arm input descriptors (c4788). THAT is the credit-recovery that lets the
++ * host issue MORE than the ~24 boot-armed frames: a fire-and-forget write with no
++ * reply never completes an output, so credits bleed to 0 at ~24; every drained
++ * reply hands one input credit back.
 + *
-+ * RX frame layout (from the HIF queue): [len@0][wsm_id@2][wsm_body@4...].
-+ * The wsm_body is the general_cmd struct {magic, cmd_id, crc, retcode,
-+ * data_len, data[]}, so ABSOLUTE offsets are: magic@4, cmd@8, crc@12,
-+ * retcode@16, data_len@20, data@24. (The old code read b[4] as "retcode",
-+ * which is actually the magic 0xACACCACA -> that was the bogus reading.)
++ * Faithful to the vendor driver (bh_sdio.c atbm_sdio_process_read_data +
++ * hwio_sdio.c atbm_data_read_unlock):
++ *   - read CONTROL(reg1) NEXT_LEN = ((c&0x0FFF)|((c&0xC000)>>2))*2
++ *   - size-validate (>= wsm_hdr(4), <= EFFECTIVE_BUF_SIZE) BEFORE reading
++ *   - CMD53-read alloc=roundup(len+2,256) from the IN_OUT queue (reg2=0x08)
++ *   - read buf_id MUST be a PERSISTENT counter cycling 1,2,3,4 across the whole
++ *     session (driver hw_priv->buf_id_rx = (buf_id_rx+1)&3, addr uses buf_id_rx+1);
++ *     resetting it per call (the old bug) desyncs the HIF and crashes it at ~5.
++ *   - take the piggybacked next-len from the last 2 bytes of each read; loop.
++ * Returns #frames drained; if want_id!=0, *rc gets that msg's retcode (word@16).
 + */
++static u8 m3_bufrx = 0;   /* persistent; reset only in atbm_link_up() */
++
++static int atbm_rx_drain(u16 want_id, s32 *rc, int max_frames, int verbose)
++{
++	static u8 b[2048];
++	u16 ctrl, id; u32 nl, alloc; int n = 0, k;
++	if (rc) *rc = -1;
++	ctrl = hif_r16(HIF_CONTROL);
++	nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
++	while (nl && n < max_frames) {
++		if (nl < 4 || nl > 1600) break;           /* driver validity guard */
++		alloc = (nl + 2 + 255) & ~255u;           /* +piggyback, round to 256 */
++		if (alloc > sizeof(b)) break;
++		if (cmd53_block(0, ((u32)((m3_bufrx & 3) + 1) << 6) | HIF_QUEUE, b, alloc))
++			break;
++		m3_bufrx = (u8)((m3_bufrx + 1) & 3);      /* persistent cycle 0..3 */
++		id = (u16)((b[2] | (b[3] << 8)) & 0x0FFF);
++		ctrl = (u16)(b[alloc-2] | (b[alloc-1] << 8));   /* piggyback next-len */
++		nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
++		n++;
++		if (verbose) {
++			printf("  atbm rx[%d] id=0x%04x:", n, id);
++			for (k = 0; k < 24; k++) printf(" %02x", b[k]);
++			printf("\n");
++		}
++		if (want_id && id == want_id && rc)
++			*rc = (s32)(b[16] | (b[17]<<8) | (b[18]<<16) | (b[19]<<24));
++	}
++	return n;
++}
++
++/* Wait briefly for a reply then drain, reporting the 0x043A confirm retcode. */
 +static int m3_read_confirm(void)
 +{
-+	static u8 b[512]; u16 ctrl, id, pb; u32 nl; int f, i, k; u8 bid = 1;
-+	/* wait up to ~2s for the MCU to queue a reply frame (it can be slow) */
-+	for (i = 0; i < 2000; i++) { ctrl = hif_r16(HIF_CONTROL); if (ctrl & 0xCFFF) break; udelay(1000); }
-+	if (!(ctrl & 0xCFFF)) { printf("  atbm: no reply frame (fire-and-forget)\n"); return -1; }
-+	nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
-+	for (f = 0; f < 12; f++) {
-+		u32 alloc;
-+		if (!nl) {
-+			for (i = 0; i < 200; i++) { ctrl = hif_r16(HIF_CONTROL); if (ctrl & 0xCFFF) break; udelay(1000); }
-+			nl = ((u32)(ctrl & 0x0FFF) | ((u32)(ctrl & 0xC000) >> 2)) * 2;
-+			if (!nl) break;
-+		}
-+		alloc = (nl + 2 + 255) & ~255u; if (alloc > 512) alloc = 512;
-+		cmd53_block(0, ((u32)bid << 6) | HIF_QUEUE, b, alloc);
-+		id = (b[2] | (b[3] << 8)) & 0x0FFF;
-+		pb = b[alloc-2] | (b[alloc-1] << 8);
-+		nl = ((u32)(pb & 0x0FFF) | ((u32)(pb & 0xC000) >> 2)) * 2;
-+		bid = (bid & 3) + 1;
-+		if (id == 0x043A) {
-+			u32 mg = b[4]  | (b[5]<<8)  | (b[6]<<16)  | (b[7]<<24);
-+			u32 cm = b[8]  | (b[9]<<8)  | (b[10]<<16) | (b[11]<<24);
-+			s32 rc = (s32)(b[16] | (b[17]<<8) | (b[18]<<16) | (b[19]<<24));
-+			printf("  atbm 0x043A raw:");
-+			for (k = 0; k < 28; k++) printf(" %02x", b[k]);
-+			printf("\n  atbm confirm: magic=0x%08x cmd=0x%x retcode=%d\n", mg, cm, rc);
-+			return rc;
-+		}
-+	}
-+	printf("  atbm: no 0x043A confirm found\n");
-+	return -1;
++	s32 rc = -1; int n, i;
++	for (i = 0; i < 800; i++) { if (hif_r16(HIF_CONTROL) & 0xCFFF) break; udelay(1000); }
++	n = atbm_rx_drain(0x043A, &rc, 16, 1);
++	if (n == 0) { printf("  atbm: no reply frame (fire-and-forget)\n"); return -1; }
++	printf("  atbm: drained %d frame(s); 0x043A retcode=%d\n", n, rc);
++	return rc;
 +}
 +
 +/* Bring MSC1/SDIO up + wake the ATBM into message mode. 0 on success. */
@@ -409,6 +426,7 @@ index 0000000..1111111
 +	e = m1_enum();
 +	if (e) { printf("atbm: SDIO enum failed (%d)\n", e); return e; }
 +	wake_light();
++	m3_bufid = 0; m3_txseq = 0; m3_bufrx = 0;   /* fresh session buf-id counters */
 +	return 0;
 +}
 +
@@ -565,6 +583,34 @@ index 0000000..1111111
 +	/* atbm ap <ssid> : plane-B msg_id 0x40 (wifi_start_ap) with SSID payload + real
 +	 * CRC-32. Switches ATBM STA->AP (deauths STA) -> stops the boot scan/reconnect
 +	 * loop (the ~56s scan-crash). SSID 1..32 chars. */
++	/* atbm ping [n] : the FULL-HANDSHAKE proof. Send a reply-eliciting cmd (0x13
++	 * wdt-disable -> 0x043A confirm) n times, DRAINING each reply. If the drain
++	 * correctly recovers input credits, all n confirm even for n>24 (the old
++	 * fire-and-forget bound). Prints running credit count from the confirms. */
++	if (argc >= 2 && !strcmp(argv[1], "ping")) {
++		int n = (argc >= 3) ? (int)simple_strtoul(argv[2], NULL, 10) : 40;
++		int ok = 0, i; s32 rc;
++		if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return CMD_RET_FAILURE; }
++		for (i = 0; i < n; i++) {
++			m3_frame(MCU_WDT_DISABLE, 0, 0);
++			mdelay(3);
++			if (atbm_rx_drain(0x043A, &rc, 8, 0) > 0 && rc == 0) ok++;
++			if (((i + 1) % 8) == 0) printf("  atbm ping: %d/%d confirmed\n", ok, i + 1);
++		}
++		printf("atbm ping DONE: %d/%d confirmed -> credit-recovery %s\n",
++		       ok, n, (ok > 24) ? "WORKS (>24)" : "INSUFFICIENT");
++		return CMD_RET_SUCCESS;
++	}
++
++	/* atbm rx : one-shot drain of pending device->host frames (verbose). */
++	if (argc >= 2 && !strcmp(argv[1], "rx")) {
++		int n;
++		if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return CMD_RET_FAILURE; }
++		n = atbm_rx_drain(0, NULL, 16, 1);
++		printf("atbm rx: drained %d frame(s)\n", n);
++		return CMD_RET_SUCCESS;
++	}
++
 +	if (argc >= 3 && !strcmp(argv[1], "ap")) {
 +		const char *ssid = argv[2];
 +		int n = (int)strlen(ssid);
@@ -585,7 +631,9 @@ index 0000000..1111111
 +	"ATBM6441 / Z7682 MCU control",
 +	"wdt on|off        - enable(0x12+0x14)/disable(0x13) the Z7682 MCU watchdog\n"
 +	"atbm mcu <c> [a]  - fire raw MCU opcode c (hex) with optional 4B arg a (hex)\n"
-+	"atbm wsm <id> [b..] - inject raw WSM cmd id (hex) + payload bytes (hex)");
++	"atbm wsm <id> [b..] - inject raw WSM cmd id (hex) + payload bytes (hex)\n"
++	"atbm ping [n]     - send 0x13 n times + drain replies (full-handshake proof)\n"
++	"atbm rx           - drain pending device->host frames");
 +#endif /* CONFIG_CMD_ATBM */
 diff --git a/board/ingenic/isvp-t23/isvp-t23.c b/board/ingenic/isvp-t23/isvp-t23.c
 index 233ed88..ae95486 100644

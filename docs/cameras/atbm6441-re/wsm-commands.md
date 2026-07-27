@@ -303,3 +303,107 @@ worked for empty-payload cmds only). WSM id = `0x003A | (tx_seq<<13)`, tx_seq 3-
 ### Recovery install path (unchanged, still the fallback)
 Flash from Thingino Linux: login `root`/`adrian`, push image over UART (raw stty +
 chunk-verified base64: scratchpad/xr.ps1), `flashcp -v ub.bin /dev/mtd0`. mtd0="boot".
+
+---
+
+## The full host<->device handshake, DECODED 2026-07-27  `[RE + LIVE]`
+
+Goal: let U-Boot issue UNLIMITED commands (not the ~24 bound of the recovery
+console) and receive device->host replies/indications. Multi-agent RE + live
+AT-console diagnosis on a stable v11 board resolved the exact mechanism.
+
+### It was never a device-state we were failing to reach
+Read the ATBM's own memory live via the AT-console in BOTH idle-U-Boot(v11) and
+full Linux (gp=0x807980; `sdio_state` = BYTE at gp-24160 = **0x801B20**):
+- `sdio_state == 2` in **both** — stable. Not 0, not the "3" the old notes chased.
+- Input-descriptor buffer array (0x801B4C, 24 ptrs `0900c878 + n*0x668`) armed in both.
+- The only U-Boot-vs-Linux deltas are TRAFFIC COUNTERS + WiFi-MAC config words.
+
+There is **no device-side handshake flag Linux sets that U-Boot doesn't**. The
+state machine (`StateMachine` @0xA9BB8, byte state, jumptable @0xA9BFC) advances
+0->1 autonomously at ATBM boot (`SdioReset` @0xA9F1E); 1->2 when the first inbound
+msg is processed (`CheckInitDone` @0xA9D98 sets gp+0x1c19=0x809599); 2->3 needs
+`0xAB000138 bit12 == 0`. **State >= 1 already un-gates the input drain+re-arm**
+(`HiSdio_ProcessInputReady` @0xC4BA0 bails only on state==0), so reaching 3 is NOT
+required.
+
+### The real gate: credits are recovered ONLY by device->host completions
+- Input descriptors are re-armed exclusively by leaf `c4788` (writes the
+  descriptor-status ring at 0xAB000000+slot*4 with bit17=armed, bumps tail
+  gp-22804=0x80206C, `depth<0x19`=25 guard => the ~24 pool = numInpChBufs).
+- **`c4788`'s ONLY caller is `c49bc`, the device->host output-COMPLETION handler
+  (event 0x4000), which itself gates on sdio_state!=0.**
+- => A fire-and-forget host write that elicits no reply consumes one input
+  descriptor and never triggers a completion, so the pool bleeds to 0 after ~24 —
+  EXACTLY the observed bound. A reply-eliciting command self-sustains (1 in ->
+  1 out -> 1 re-arm). Confirmed live: driving version-reads grew the ring tail
+  past its boot value; blind fire-and-forget froze + crashed the ATBM.
+
+### The deployable fix (host-side, no firmware download, no AHB SMU init)
+The ATBM self-boots its 2MB flash firmware, so the three `after_load_firmware`
+AHB SMU writes (0x161000ac / 0x1610102c+poll / 0x16100074) are ALREADY satisfied —
+skip them (they exist only for the fw-DOWNLOAD path, done with the CPU held in
+reset). NEVER assert CONFIG CPU_RESET(bit14) — it halts the running firmware.
+
+Host must simply, over SDIO func1 (block size 256):
+1. Enter message mode: CONTROL |= WUP(bit12); CONFIG &= ~ACCESS_MODE(bit10); dummy
+   read CONFIG (arms the IRQ). (v11's `wake_light` already does this; state=2 proves it.)
+2. **Service the device->host direction** = the actual unlimited-commands fix:
+   read CONTROL(reg1) NEXT_LEN `((c&0x0FFF)|((c&0xC000)>>2))*2`; while nonzero,
+   size-validate (>= wsm_hdr(4), <= EFFECTIVE_BUF_SIZE) then CMD53-read
+   `roundup(len+2,256)` bytes from the IN_OUT queue (reg2 = SDIO addr 0x08); take
+   the piggybacked next-len from the last 2 bytes; loop. **The read buf_id MUST be
+   a PERSISTENT counter cycling 1,2,3,4 across the whole session** (driver
+   `hw_priv->buf_id_rx`, addr uses buf_id_rx+1) — resetting it per call desyncs the
+   HIF and crashes the ATBM at ~5 reads (the bug in the old confirm reader).
+
+Addressing: `SDIO_addr17 = (buf_id<<6)|(force<<5)|((reg_id<<2)&0x1F)`. CONFIG=reg0
+(0x00), CONTROL=reg1 (0x04), IN_OUT_QUEUE=reg2 (0x08), AHB_DPORT=reg3 (0x0C),
+SRAM_BASE=reg4 (0x10).
+
+### Live diagnostic map (AT+rmem, ATBM side; gp=0x807980)
+| addr | what | note |
+|------|------|------|
+| 0x801B20 (u8) | sdio_state | 2=running; !=0 ungates drain/re-arm |
+| 0x809599 (u8) | 1->2 flag | set by CheckInitDone on first inbound msg |
+| 0x80206C (u32) | ring tail (produced) | bumped by c4788 re-arm; watch it advance |
+| 0x802070 (u32) | ring head (consumed) | |
+| 0x802074 (u32) | ring modulus | 0x40 |
+| 0x802078 (u32) | input ring base | 0x0AB00000 (DRAM) |
+| 0x0AB00000 | INPUT desc ring | `[len/flags:16][buf_lo:16]` x N, bit17=armed |
+| 0x0AB00100 | OUTPUT ring | device->host `[buf_ptr][len]` pairs |
+NB: 0xAB000000 (peripheral HIF regs, bit12 gate @0x138) reads 0 via AT+rmem; probe
+those from the T23/CMD52 side. 0x0AB00000 (DRAM rings) IS AT+rmem-readable.
+
+### U-Boot implementation + LIVE PROOF (2026-07-27)  `[LIVE PASS]`
+
+Implemented in `board/ingenic/isvp-t23/atbm_wdt.c` (patch 0002-cmd-atbm-wdt.patch):
+- `atbm_rx_drain(want_id, *rc, max, verbose)` — the device->host output-ring drain.
+  Persistent `m3_bufrx` (cycles 1,2,3,4 across the whole session; the OLD confirm
+  reader reset it per-call -> HIF desync -> ATBM crash at ~5 reads), driver
+  size-validity guard (`nl < 4 || nl > 1600 -> stop`), CMD53-read `roundup(nl+2,256)`
+  from the IN_OUT queue, piggyback next-len from the last 2 bytes, loop.
+- `m3_read_confirm()` now wraps `atbm_rx_drain`; buf-id counters reset in `atbm_link_up`.
+- New U-Boot cmds: `atbm ping [n]` (send 0x13 n times + drain each reply — the
+  unlimited-commands proof) and `atbm rx` (one-shot verbose drain).
+
+**LIVE-VERIFIED on the camera:**
+```
+atbm ping DONE: 34/40 confirmed -> credit-recovery WORKS (>24)
+FINAL ring: tail=0x3b(59) head=0x2a(42) sdio_state=0x2 ; U-Boot prompt alive
+```
+40 commands issued from U-Boot, board survived (old fire-and-forget crashed at ~24 /
+the un-drained reader crashed at ~5). The ring HEAD reached 42 and TAIL 59 — input
+descriptors re-armed far past the 24 boot pool, exactly because each drained reply
+fired the fw output-completion -> `c4788` re-arm. `sdio_state` stayed 2 throughout;
+no crash. This is UNLIMITED bidirectional U-Boot<->ATBM messaging.
+
+Note: "34/40 confirmed" is the simple per-command confirm-MATCH heuristic (a 0x043A
+reply sometimes lands in the next command's drain window); ALL 40 were delivered
+(head=42) and the ring never starved. A stricter transport would tag/track confirms
+per command — polish, not a transport limit.
+
+Build gotcha (recorded): `make uboot-rebuild` HANGS forever with no output because
+board.mk runs the interactive `select_camera.sh` (2>/dev/tty) at parse time when >1
+camera defconfig exists and no tty is attached. Always build headless with
+`make CAMERA=cinnado_s2_t23zn_os02g10_atbm6441 uboot-rebuild`.
