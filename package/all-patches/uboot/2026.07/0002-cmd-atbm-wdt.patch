@@ -524,17 +524,17 @@ index 0000000..1111111
 +	printf("atbm: recovery console -> MCU wdt off + stop WiFi scan (start_ap)\n");
 +	/* Two force-bit injects to CYCLED buf_ids (0,1) -> two fresh input descriptors:
 +	 *   0x13 = MCU watchdog disable (kills the ~14s MCU-wdt reset).
-+	 *   0x40 = wifi_start_ap "s2": flips the scanning STA vif to AP so the reconnect
-+	 *          tick stops (no LMACtoUMAC_ScanComplete assert -> no ~26-40s scan-crash).
-+	 * LIVE-verified: 0x40 reaches the MCU (message_mgr wifi_start_ap:s2 -> bcreate_ap
-+	 * ssid:s2). Both must land or the un-killed reset still fires. */
++	 *   0x40 = wifi_start_ap "thingino-recovery": flips the scanning STA vif to AP so recon-
++	 * nect stops (no LMACtoUMAC_ScanComplete assert). This recovery-only dummy AP was
++	 * named "s2" in early tests; renamed so the FINAL AP name is owned by Linux
++	 * (atbm_softap -> THINGINO-XXXX). Both injects must land or the reset still fires. */
 +	if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return; }
 +	m3_frame(MCU_WDT_DISABLE, 0, 0);       /* buf_id0: wdt off */
 +	mdelay(5);
-+	m3_msg(0x40, (const u8 *)"s2", 2);     /* buf_id1: start_ap -> stop scan */
++	m3_msg(0x40, (const u8 *)"thingino-recovery", 17); /* buf_id1: start_ap -> stop scan */
 +	mdelay(30);
 +	(void)m3_read_confirm();
-+	printf("atbm: MCU wdt off + start_ap(s2). Idle U-Boot should be crash-proof.\n");
++	printf("atbm: MCU wdt off + start_ap(thingino-recovery). Idle U-Boot crash-proof.\n");
 +}
 +
 +/* Cycling raw-WSM sender for PLANE-A (WiFi-MAC) commands. Like m3_wsm_raw but

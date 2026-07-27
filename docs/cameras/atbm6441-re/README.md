@@ -10,6 +10,15 @@ parent doc [`../cinnado_s2_atbm6441.md`](../cinnado_s2_atbm6441.md) §14. This R
 - [`at-console.md`](at-console.md) — the ATBM AT-command console (how we dumped the flash)
 - [`tools/`](tools/) — the scripts
 
+U-Boot integration & recovery (how the RE turned into shipped bootloader behaviour):
+
+- [`uboot-clean-recovery.md`](uboot-clean-recovery.md) — **current bootloader**: clean U-Boot,
+  RST-hold factory reset + LED, AP-SSID ownership (the "s2" fix), flash partition map &
+  factory-reset correctness proof, and the on-hardware verify checklist
+- [`uboot-wifi-datapath.md`](uboot-wifi-datapath.md) — softMAC WiFi data-path RE (TX/RX WSM path)
+- [`uboot-wifi-eth-driver-WIP.md`](uboot-wifi-eth-driver-WIP.md) — the shelved U-Boot-WiFi eth
+  driver, preserved for later (drain-for-association finding + gotchas)
+
 Tags used throughout: **[LIVE]** = observed on the running chip, **[RE]** = from static
 disassembly, **[TBC]** = unconfirmed.
 
