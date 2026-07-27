@@ -407,3 +407,42 @@ Build gotcha (recorded): `make uboot-rebuild` HANGS forever with no output becau
 board.mk runs the interactive `select_camera.sh` (2>/dev/tty) at parse time when >1
 camera defconfig exists and no tty is attached. Always build headless with
 `make CAMERA=cinnado_s2_t23zn_os02g10_atbm6441 uboot-rebuild`.
+
+---
+
+## RST button + PIR from U-Boot, SOLVED + LIVE-VERIFIED 2026-07-27  `[LIVE]`
+
+The camera has two buttons: a **POWER** button (autonomous ATBM-PMU, 6s-hold on/off,
+NOT host-visible) and the **RST** button. RST = **KEY0 = ATBM GPIO channel 17**.
+
+Source register (ATBM GPIO bank 0, base 0x16800000): **input-level `0x16800020`**
+- **bit17 (0x00020000) = RST/KEY0, active-LOW** (1=released, 0=pressed). LIVE: 20 clean
+  1<->0 flips for 10 presses on the AT-console; U-Boot poll matched.
+- bit25 (0x02000000) = PIR, active-HIGH (1=motion). bit16=CHARGE, bit19=USB-plug.
+- fw refs: gpio_read helper 0xceeb0 (`lwi [0x16800000+0x20]`); KEY0 ISR 0xaa2f0
+  (KEY0_PRESSED/RELEASED strings); PIR ISR 0xa9fba (needs >=3-sample debounce + PIR_ENABLE).
+
+Two host-side read paths, BOTH implemented in U-Boot (atbm_wdt.c) and live-verified:
+
+### PATH A — poll the GPIO level via the SDIO AHB window  (`atbm button`, `atbm ahb`)
+`atbm_ahb_r32(addr)` = vendor `atbm_direct_read_reg_32`: **set CONFIG ACCESS_MODE
+(bit10) to enter register mode**, then the indirect read (SRAM_BASE=addr, set CONFIG
+AHB_PFETCH bit11, poll until it self-clears, read AHB_DPORT reg3=0x0C), then restore
+CONFIG (back to message mode). The ACCESS_MODE switch is MANDATORY — without it the
+windowed read never engages and returns stale queue bytes (a `0x0805` fragment).
+Proof: `atbm ahb 16600000` = 0x03002001 (== AT-console WDT read); `atbm button` poll
+tracked bit17 (0x02020000 released <-> 0x02000000 pressed) across 10 presses.
+Best for a boot-time "hold RST -> recovery" gesture (synchronous level read).
+
+### PATH B — drain the device->host event  (`atbm rx`)
+Pressing RST makes the fw emit a WSM **event indication id 0x0805, eventId=16 (0x10)**,
+payload **word0 bitmask: 0x01=press / 0x02=release / 0x08=PIR / 0x4000=tamper** (matches
+the 2026-07-25 driver RE exactly). Our output-ring drain reads it directly:
+```
+atbm rx ->  0x0805 eventId=0x10 word0=0x01   (RST press)
+            0x0805 eventId=0x10 word0=0x02   (RST release)
+            0x0805 eventId=0x10 word0=0x08   (PIR motion)
+```
+Confirmed live at idle U-Boot with sdio_state=2 (the fw's "event drop unless sdio
+init" gate is satisfied by our normal running state — no extra enable needed for KEY0;
+PIR edges also arrived). Event-based: good for catching a press, ~edge latency.

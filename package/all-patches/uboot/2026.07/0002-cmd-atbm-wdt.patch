@@ -12,7 +12,7 @@ new file mode 100755
 index 0000000..1111111
 --- /dev/null
 +++ b/board/ingenic/isvp-t23/atbm_wdt.c
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,682 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
@@ -537,6 +537,39 @@ index 0000000..1111111
 +	printf("atbm: MCU wdt off + start_ap(s2). Idle U-Boot should be crash-proof.\n");
 +}
 +
++/* ---- AHB windowed read: host reads an ATBM AHB peripheral reg over SDIO ----
++ * Recipe = vendor driver atbm_indirect_read (hwio_sdio.c): write SRAM_BASE=addr,
++ * set CONFIG AHB_PFETCH (bit11), poll until it self-clears, read AHB_DPORT. Uses
++ * the existing func1 helpers (SRAM_BASE=reg4=0x10, AHB_DPORT=reg3=0x0C). */
++#define CFG_AHB_PFETCH   (1u << 11)
++static u32 atbm_ahb_r32(u32 ahb_addr)
++{
++	u32 orig, cfg, data; int i;
++	/* Vendor atbm_direct_read_reg_32: must switch the HIF to REGISTER mode
++	 * (CONFIG ACCESS_MODE=bit10) around the indirect read, else in message mode
++	 * the windowed read never engages and returns stale queue bytes. Restore after. */
++	orig = hif_r32(HIF_CONFIG);
++	hif_w32(HIF_CONFIG, orig | CFG_ACCESS_MODE);
++	hif_w32(HIF_SRAM_BASE, ahb_addr);
++	cfg = hif_r32(HIF_CONFIG);
++	hif_w32(HIF_CONFIG, cfg | CFG_AHB_PFETCH);
++	for (i = 0; i < 20 && (hif_r32(HIF_CONFIG) & CFG_AHB_PFETCH); i++) mdelay(1);
++	data = hif_r32(HIF_AHB_DPORT);
++	hif_w32(HIF_CONFIG, orig);   /* back to message mode for the WSM plane */
++	return data;
++}
++
++/* RST button = ATBM GPIO 0x16800020 bit17, active-LOW (0 = pressed). LIVE-verified
++ * (AT-console: bit17 1<->0 tracks release<->press). The POWER button is a separate
++ * MCU input (6s hold = autonomous power on/off), NOT this bit. */
++#define ATBM_GPIO_INPUT  0x16800020u
++#define ATBM_KEY0_BIT    17
++static int atbm_rst_pressed(void)
++{
++	u32 v = atbm_ahb_r32(ATBM_GPIO_INPUT);
++	return ((v >> ATBM_KEY0_BIT) & 1) ? 0 : 1;
++}
++
 +#if defined(CONFIG_CMD_ATBM)
 +static int do_atbm(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
 +{
@@ -577,6 +610,31 @@ index 0000000..1111111
 +		printf("atbm: inject WSM id=0x%04x paylen=%d\n", id, n);
 +		m3_wsm_raw(id, pl, n);
 +		mdelay(20);
++		return CMD_RET_SUCCESS;
++	}
++
++	/* atbm ahb <addr> : read an ATBM AHB register over SDIO (host AHB window).
++	 * Sanity: `atbm ahb 16600000` should read 0x03002001 (WDT base, matches AT+rmem). */
++	if (argc >= 3 && !strcmp(argv[1], "ahb")) {
++		u32 a = simple_strtoul(argv[2], NULL, 16);
++		if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return CMD_RET_FAILURE; }
++		printf("atbm ahb 0x%08x = 0x%08x\n", a, atbm_ahb_r32(a));
++		return CMD_RET_SUCCESS;
++	}
++
++	/* atbm button [n] : read the RST button (ATBM GPIO 0x16800020 bit17, active-low)
++	 * via the SDIO AHB window. With n>1, poll n times @200ms to watch it toggle. */
++	if (argc >= 2 && !strcmp(argv[1], "button")) {
++		int n = (argc >= 3) ? (int)simple_strtoul(argv[2], NULL, 10) : 1;
++		int i;
++		if (atbm_ensure_linked()) { printf("atbm: link-up failed\n"); return CMD_RET_FAILURE; }
++		for (i = 0; i < n; i++) {
++			u32 v = atbm_ahb_r32(ATBM_GPIO_INPUT);
++			printf("atbm RST: %s  (0x16800020=0x%08x bit17=%d)\n",
++			       ((v >> ATBM_KEY0_BIT) & 1) ? "released" : "*** PRESSED ***",
++			       v, (int)((v >> ATBM_KEY0_BIT) & 1));
++			if (n > 1) mdelay(200);
++		}
 +		return CMD_RET_SUCCESS;
 +	}
 +
@@ -633,7 +691,9 @@ index 0000000..1111111
 +	"atbm mcu <c> [a]  - fire raw MCU opcode c (hex) with optional 4B arg a (hex)\n"
 +	"atbm wsm <id> [b..] - inject raw WSM cmd id (hex) + payload bytes (hex)\n"
 +	"atbm ping [n]     - send 0x13 n times + drain replies (full-handshake proof)\n"
-+	"atbm rx           - drain pending device->host frames");
++	"atbm rx           - drain pending device->host frames\n"
++	"atbm ahb <addr>   - read an ATBM AHB register (hex) over SDIO\n"
++	"atbm button [n]   - read RST button (GPIO 0x16800020 bit17, active-low)");
 +#endif /* CONFIG_CMD_ATBM */
 diff --git a/board/ingenic/isvp-t23/isvp-t23.c b/board/ingenic/isvp-t23/isvp-t23.c
 index 233ed88..ae95486 100644
