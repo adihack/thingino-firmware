@@ -684,6 +684,14 @@ builds. A freshly built image had `rootfs 4608k` / `data @0x640000` while the fl
 into `/overlay/...` **shadows** the flashed rootfs and survives a rootfs reflash. Remember to
 clear overrides after flashing. [LIVE]
 
+**Factory reset = wipe mtd4 (`data`/overlay).** The clean U-Boot's RST-hold-10s gesture runs
+`overlay_wipe` (chunked `sf erase` of the `data` partition); a running Linux does it reliably with
+`flash_erase /dev/mtd4 0 0`. Because the offset is size-fragile (above), the hardcoded
+`overlay_wipe` offset is only correct when the **full image is flashed together** (U-Boot env +
+kernel + rootfs consistent). See [`atbm6441-re/uboot-clean-recovery.md`](atbm6441-re/uboot-clean-recovery.md)
+for the clean-bootloader design, the AP-SSID ownership fix (the "s2" AP was a U-Boot artifact —
+Linux owns the name via `atbm_softap`), and the on-hardware verify checklist. [2026-07-27]
+
 ---
 
 ## 9. Imaging, day/night, audio
