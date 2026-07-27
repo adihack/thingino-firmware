@@ -12,7 +12,7 @@ new file mode 100755
 index 0000000..1111111
 --- /dev/null
 +++ b/board/ingenic/isvp-t23/atbm_wdt.c
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,782 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
@@ -597,6 +597,47 @@ index 0000000..1111111
 +	return ((v >> ATBM_KEY0_BIT) & 1) ? 0 : 1;
 +}
 +
++/* ---- status LED (T23 GPIO49 = port B pin 17), JZ GPIO regs @ GPIOB=0xb0011000:
++ * config output = INTC(0x18)+MASKS(0x24 gpio-mode)+PAT1C(0x38 output);
++ * level = PAT0S(0x44) high / PAT0C(0x48) low. LED assumed active-high. ---- */
++#define LED_STATUS   (1u << 17)   /* gpio49 = PB17 */
++static void led_cfg(void) { wr(GPIOB + 0x18, LED_STATUS); wr(GPIOB + 0x24, LED_STATUS); wr(GPIOB + 0x38, LED_STATUS); }
++static void led(int on)   { wr(GPIOB + (on ? 0x44 : 0x48), LED_STATUS); }
++
++/*
++ * Boot-time RST recovery gesture (called from board_late_init, before autoboot).
++ * If the RST button (ATBM GPIO 0x16800020 bit17, active-low) is HELD at power-on,
++ * blink the status LED while counting; hold 10 s -> FACTORY RESET via the chunked
++ * `overlay_wipe` env (sf-erase the overlay/data region + reset). Release before
++ * 10 s -> normal boot. Reading RST needs the ATBM SDIO link; if it can't come up,
++ * or RST isn't held, we return immediately (normal boot, MCU wdt untouched).
++ * UNTESTED ON HARDWARE 2026-07-27: verify LED pin/polarity + the 10 s reset path.
++ */
++void atbm_rst_recovery_check(void)
++{
++	int held = 0, on = 0, period;
++	if (atbm_ensure_linked()) return;          /* SDIO down -> normal boot */
++	if (!atbm_rst_pressed()) return;           /* RST not held -> normal boot */
++	printf("\natbm: RST held at boot -> keep holding 10s for FACTORY RESET (release to cancel)\n");
++	atbm_wdt_set(0);                           /* kill the ~14.5s MCU wdt for the window */
++	led_cfg();
++	while (atbm_rst_pressed()) {
++		period = (held < 5000) ? 400 : (held < 8000) ? 200 : 100;  /* blink faster near 10s */
++		led(on ^= 1);
++		mdelay(period);
++		held += period;
++		if ((held % 1000) < period) printf("  atbm: RST held %ds ...\n", held / 1000);
++		if (held >= 10000) {
++			printf("atbm: 10s -> FACTORY RESET: overlay wipe (chunked) + reboot\n");
++			led(1);
++			run_command("run overlay_wipe", 0);   /* chunked sf erase + reset */
++			return;                               /* overlay_wipe resets; not reached */
++		}
++	}
++	led(0);
++	printf("atbm: RST released before 10s -> normal boot\n");
++}
++
 +#if defined(CONFIG_CMD_ATBM)
 +static int do_atbm(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
 +{
@@ -691,6 +732,8 @@ index 0000000..1111111
 +			       v, (int)((v >> ATBM_KEY0_BIT) & 1));
 +			if (n > 1) mdelay(200);
 +		}
++		/* bare `atbm button` -> exit code from state (for `if atbm button`) */
++		if (n == 1) return atbm_rst_pressed() ? CMD_RET_SUCCESS : CMD_RET_FAILURE;
 +		return CMD_RET_SUCCESS;
 +	}
 +
@@ -765,7 +808,7 @@ index 233ed88..ae95486 100644
  
  #if defined(CONFIG_USB) || defined(CONFIG_USB_GADGET)
  #include <dm/ofnode.h>
-@@ -174,3 +176,22 @@ int checkboard(void)
+@@ -174,3 +176,23 @@ int checkboard(void)
  {
  	return 0;
  }
@@ -784,6 +827,7 @@ index 233ed88..ae95486 100644
 +		printf("atbm: WDT_DISABLE=1 -> disabling Z7682 MCU watchdog\n");
 +		atbm_wdt_set(0);
 +	}
++	atbm_rst_recovery_check();   /* RST held ~10s at boot -> factory reset */
 +#endif
 +	return 0;
 +}
@@ -836,7 +880,7 @@ new file mode 100755
 index 0000000..3b62866
 --- /dev/null
 +++ b/include/atbm_wdt.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,37 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control from U-Boot.
@@ -866,5 +910,11 @@ index 0000000..3b62866
 + * watchdog when U-Boot drops to the interactive console (autoboot interrupted).
 + */
 +void atbm_wdt_console_entry(void);
++
++/*
++ * Boot-time RST-hold recovery: RST held ~10s at power-on -> chunked overlay
++ * wipe (factory reset) with LED feedback. Call from board_late_init.
++ */
++void atbm_rst_recovery_check(void);
 +
 +#endif /* __ISVP_T23_ATBM_WDT_H__ */
