@@ -3,22 +3,25 @@
 echo -c 196 -e "\n\nGoing to reboot!\n"
 
 # Cinnado S2 reliable reboot. A T23-only warm reboot HANGS and leaves the ATBM
-# WiFi core stale (WiFi never comes back; even the armed HW watchdog reset does
-# not recover this board). The fix is to SMU-reset the ATBM so its
-# master_power_on cold-boots BOTH chips within ~4 s = a clean reboot.
-# CRITICAL: do it HERE, first, while WiFi/SDIO are still fully up. The AHB SMU
-# reset does NOT land once the wireless-stop scripts (ifdown/wpa_supplicant) have
-# run. sync first so the overlay (jffs2) is flushed before the reset.
+# WiFi core stale (WiFi never comes back; even the HW watchdog does not recover
+# the board). The reliable fix is to reboot BOTH chips via the ATBM/Z7682
+# master_wdt: arming it makes the MCU's master-power state machine power-cycle
+# the whole board (master_wdt_timer_cb -> master_power_off -> "reboot two
+# devices" -> HI_SDIO_Host_Reboot). This is STATE-INDEPENDENT (the Z7682 is a
+# separate always-on core), unlike the driver's AHB SMU poke, which stops
+# landing once the ATBM WiFi core has aged into low-power. The MCU only needs the
+# SDIO/WSM link at ARM time, then fires autonomously - so nothing after this can
+# stop it. sync first so the overlay (jffs2) is flushed before the reset.
 sync
-if [ -e /sys/module/atbm6441_wifi_sdio/atbmfs/atbm_smu_reset ]; then
-	echo -c 15 "Cinnado S2: SMU-reset ATBM -> both-chip cold boot"
-	echo 1 > /sys/module/atbm6441_wifi_sdio/atbmfs/atbm_smu_reset
-	sleep 12   # master_power_on hard-resets us within ~4 s; fall through only if it did not
+if [ -x /usr/bin/mcu_wdt_arm ]; then
+	echo -c 15 "Cinnado S2: arm MCU master_wdt -> both-chip cold boot"
+	mcu_wdt_arm 5
+	sleep 15   # the MCU reboots both chips in ~5 s; fall through only if it did not
 fi
 
-# ---- Fallback (SMU reset did not cold-boot us): normal orderly shutdown ----
+# ---- Fallback (master_wdt did not fire): orderly shutdown + reboot -f + HW wdt ----
 # Run init scripts in the desired order: F, K, S with reversed numerical order within each group.
-# Skip K99watchdog — handled after sync so the hardware watchdog stays armed as a fallback.
+# Skip K99watchdog so the hardware watchdog stays armed as a last-resort fallback.
 for letter in F K S; do
 	for i in $(find /etc/init.d/ -name "${letter}*" -executable | grep -v 'K99watchdog' | sort -r); do
 		/bin/sh -c "$i stop"
@@ -27,10 +30,7 @@ done
 
 sync
 
-# Kill watchdog with SIGKILL (NOT SIGTERM) so it cannot write the magic 'V'
-# that would disarm the hardware watchdog. The hardware timer then expires
-# within the configured timeout (default 60 s) and forces a hardware reset —
-# guaranteed fallback if the kernel reboot path hangs.
+# Kill watchdog with SIGKILL so it cannot disarm the hardware watchdog.
 WD_PID=$(cat /var/run/watchdog.pid 2>/dev/null)
 [ -n "$WD_PID" ] && kill -9 "$WD_PID" 2>/dev/null
 killall -9 watchdog 2>/dev/null || true
