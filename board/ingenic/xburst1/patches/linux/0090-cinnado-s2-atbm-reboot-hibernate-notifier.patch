@@ -1,0 +1,56 @@
+From: thingino <noreply@thingino>
+Subject: [PATCH] soc-t23: reboot-notifier to hibernate-reset (ATBM6441 boards)
+
+On ATBM6441 boards (e.g. Cinnado S2) the WDT soft-reset HANGS - it does not
+re-cycle the SPI-NOR/ATBM so the bootrom cannot reload TPL. hibernate_restart()
+works but its wake is the ATBM power-cycling the T23, which needs the SDIO/ATBM
+link ALIVE; machine_restart runs after device_shutdown (SDIO gone) -> hang. Fire
+the hibernate from a reboot-notifier (kernel_restart_prepare, BEFORE device_shutdown,
+driver still loaded) so the ATBM wakes the T23. Gated on CONFIG_HIBERNATE_RESET so
+only opted-in boards (via their kernel fragment) change behaviour. Live-verified.
+---
+--- a/arch/mips/xburst/soc-t23/common/reset.c
++++ b/arch/mips/xburst/soc-t23/common/reset.c
+@@ -23,6 +23,7 @@
+ #include <soc/tcu.h>
+ #include <linux/slab.h>
+ #include <asm/reboot.h>
++#include <linux/reboot.h>
+ 
+ #define RTC_RTCCR		(0x00)	/* rw, 32, 0x00000081 */
+ #define RTC_RTCSR		(0x04)	/* rw, 32, 0x???????? */
+@@ -195,11 +196,34 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_HIBERNATE_RESET
++/*
++ * Cinnado S2 (ATBM6441 power-gates the T23): the WDT soft-reset HANGS (does not re-cycle the
++ * SPI-NOR/ATBM so the bootrom can't reload TPL). hibernate_restart() works, but its wake is the
++ * ATBM power-cycling the T23 (master_power_on) which needs the SDIO/ATBM link ALIVE.
++ * machine_restart runs after device_shutdown (SDIO torn down) -> hang. This reboot-notifier
++ * fires in kernel_restart_prepare, BEFORE device_shutdown, while the WiFi driver is still loaded
++ * (the reboot service-shutdown does not rmmod it - verified) -> the ATBM wakes the T23 and reboot
++ * works for every caller. Gated on CONFIG_HIBERNATE_RESET so only opted-in boards get it.
++ */
++static int jz_reboot_hibernate_notify(struct notifier_block *nb,
++				      unsigned long action, void *data)
++{
++	if (action == SYS_RESTART)
++		hibernate_restart();   /* full RTC power-cycle; never returns */
++	return NOTIFY_DONE;
++}
++static struct notifier_block jz_reboot_hibernate_nb = {
++	.notifier_call = jz_reboot_hibernate_notify,
++};
++#endif
++
+ int __init reset_init(void)
+ {
+ 	pm_power_off = jz_hibernate;
+ #ifdef CONFIG_HIBERNATE_RESET
+ 	_machine_restart = jz_hibernate_restart;
++	register_reboot_notifier(&jz_reboot_hibernate_nb);
+ #else
+ 	_machine_restart = jz_wdt_restart;
+ #endif

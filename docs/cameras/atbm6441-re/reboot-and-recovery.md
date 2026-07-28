@@ -68,20 +68,27 @@ hang, STA settings never applied → "set STA mode, didn't connect". With `/bin/
 **client mode** (no AP/portal flag, `wlan0` no IP because the test SSID doesn't exist). The AP
 path (`mode=2`) restores on the next reboot. Chain fixed.
 
-## 5. Proper fix (future, not shipped)
+## 5. Deployable fix — SHIPPED (kernel reboot-notifier)
 
-**Deployment note:** the `/bin/reboot` wrapper (§3) is live on *this unit's* overlay, but
-thingino's `BR2_ROOTFS_OVERLAY` (`configs/fragments/core.fragment`) is **global** — one `overlay/`
-for all cameras — and a hibernate `/bin/reboot` would **hang non-ATBM boards** (whose WDT reboot
-works fine). So there is no clean per-camera rootfs path; the *deployable* board-specific fix must
-be **kernel-based** (this camera already carries its own kernel fragment). Two kernel-only options,
-both cleaner than the wrapper:
-- **Enable the RTC** so the hibernate wake-alarm self-fires (set `RTCCR` RTCE bit in
-  `hibernate_restart`, and `_machine_restart = jz_hibernate_restart`). Gives a fast (~5 s),
-  self-contained wake independent of the ATBM — **if** the RTC actually counts on this board
-  (untested; the RTC may have no oscillator populated).
-- Or a **reboot-notifier** that runs `hibernate_restart()` *before* `device_shutdown` (while the
-  SDIO/ATBM is still up), making all reboots use the ATBM power-cycle transparently.
+The `/bin/reboot` wrapper (§3) is live on *this unit's* overlay, but thingino's
+`BR2_ROOTFS_OVERLAY` (`configs/fragments/core.fragment`) is **global** — one `overlay/` for all
+cameras — and a hibernate `/bin/reboot` would **hang non-ATBM boards** (whose WDT reboot works).
+So the deployable fix is **kernel-based**, shipped as
+`board/ingenic/xburst1/patches/linux/0090-cinnado-s2-atbm-reboot-hibernate-notifier.patch`:
+
+a **reboot-notifier** in `reset.c` that calls `hibernate_restart()` on `SYS_RESTART` from
+`kernel_restart_prepare` — **before** `device_shutdown`, while the WiFi driver is still loaded (the
+reboot service-shutdown does *not* rmmod it — verified) — so the ATBM wakes the T23. Gated on
+`CONFIG_HIBERNATE_RESET` (this camera's kernel fragment) so other xburst1 boards are unaffected.
+
+**Live-verified: with the `/bin/reboot` wrapper removed, a native `reboot` reboots cleanly**
+(T23 TPL ~66 s → login). So every caller — the WiFi portal (`api.cgi reboot -d 2 &`),
+`reboot.cgi`, the shell — now works, and **web-panel device/WiFi setup applies correctly**. Reboot
+is ~60-90 s (the ATBM power-cycle is slow) but reliable. The `/bin/reboot` wrapper is redundant
+once this kernel ships (kept only as a kernel-independent fallback).
+
+Alternative (not needed): enable the RTC so the hibernate alarm self-wakes (~5 s, no ATBM
+dependency) — untested; the RTC may have no oscillator populated.
 
 ## 6. Related: the "s2" soft-AP
 
