@@ -1,5 +1,39 @@
 # Reboot-hang, remote recovery, and the WiFi-config-apply chain (Cinnado S2, 2026-07-28)
 
+> **✅ SOLVED (2026-07-28, later same day — supersedes the hibernate approach in §1).** The
+> reliable fix is **not** kernel hibernate. Root cause: the driver's AHB **SMU reset** (the RE'd
+> AT+REBOOT sequence, §2) only *lands* while WiFi/SDIO are **fully up** — once the shutdown's
+> wireless-stop scripts (`S36wireless`/`S38wpa_supplicant` → `ifdown wlan0`) have run, the AHB
+> write silently fails. So a kernel reboot-notifier or any post-teardown hook fires too late
+> (both were tried and both failed live).
+>
+> **The fix:** `overlay/etc/init.d/rcK` fires the SMU reset **first**, right after "Going to
+> reboot!", before the F/K/S stop loop:
+> ```sh
+> sync
+> if [ -e /sys/module/atbm6441_wifi_sdio/atbmfs/atbm_smu_reset ]; then
+>     echo 1 > /sys/module/atbm6441_wifi_sdio/atbmfs/atbm_smu_reset
+>     sleep 12   # ATBM master_power_on cold-boots BOTH chips within ~4 s
+> fi
+> ```
+> The driver half — patch `package/all-patches/wifi-atbm6441/0101-cinnado-s2-smu-reset-reboot.patch`
+> — adds a **write-only sysfs trigger** `atbm_smu_reset` under `/sys/module/atbm6441_wifi_sdio/atbmfs/`
+> that calls `atbm_reset_lmc_cpu()` (the SMU sequence, §2). **Validated live: 5/5 clean `reboot`s,
+> 0 hangs** — UART shows each: `Going to reboot`→`SMU-reset ATBM`→`flashIotBoot`(ATBM reset)→
+> `T23 TPL`→`WIFI_CONNECT_SUCCESS@13 s`, reachable in ~36 s. A clean-rebuild confirms 0100+0101
+> apply from a pristine extract. Key: a **T23-only reset (WDT / armed HW-watchdog) never recovers
+> this board** — only resetting the ATBM (→ its `master_power_on`) does. §1's
+> `CONFIG_HIBERNATE_RESET` / reboot-notifier (commits e402188, f13a0a7) are now dead code, benign
+> (the SMU reset fires before `reboot -f` is ever reached).
+>
+> **Hung-cam recovery** (after the host goes silent the ATBM sleeps ~200 s; its AT console is dead
+> while asleep but it wakes ~every 300 s for DHCP): `scratchpad/recover_persistent.ps1` floods
+> `AT+rmem` to catch the wake window, then fires the SMU sequence. Caught it at 20–101 s each run.
+>
+> The sections below are the earlier (hibernate) analysis, kept for background.
+
+---
+
 All **live-verified** on the unit this day. This resolves a chain: the WiFi portal couldn't
 apply STA (client) settings → because it applies them by **rebooting** → because **`reboot`
 hangs on this board**.

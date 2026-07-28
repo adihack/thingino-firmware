@@ -1,0 +1,132 @@
+diff --git a/hal_apollo/apollo_sdio.c b/hal_apollo/apollo_sdio.c
+old mode 100755
+new mode 100644
+index 2164282..b9a0390
+--- a/hal_apollo/apollo_sdio.c
++++ b/hal_apollo/apollo_sdio.c
+@@ -1108,6 +1108,46 @@ static void atbm_wtd_exit(void)
+ }
+ int atbm_reset_lmc_cpu(struct atbm_common *hw_priv)
+ {
++	/*
++	 * Cinnado S2 warm-reboot recovery. On this HERA build the driver never resets the
++	 * ATBM WiFi CPU (fw download/CPU-reset compiled out), so after a T23-only warm reboot
++	 * the ATBM keeps running and never re-emits WSM STARTUP_IND -> atbm_core_probe wedges
++	 * on "mdelay wait wsm_startup_done" (~50% of warm reboots). This stub used to return 0
++	 * (no-op), so the probe's timeout-retry looped forever.
++	 *
++	 * Fix: replicate exactly what AT+REBOOT does, over the SDIO->AHB window. Reversed from
++	 * the ATBM firmware: AT+REBOOT handler(0xe5254) -> system_reboot(0xa7ae0) ->
++	 * Hardware_Reboot(0xb4f22) -> reset core(0xae264). The core does an SMU/clock quiesce +
++	 * re-init, then triggers 0x16101000 |= BIT(0) ("sys_shut_down"). The ATBM cold-boots and
++	 * its master_power_on re-cycles the T23 too => a fresh both-chip cold boot => STARTUP_IND
++	 * arrives on the next probe and WiFi comes up clean. Validated live via AT+wmem.
++	 * (Do NOT use the SDIO-CONFIG CPU_RESET bit here: it is a bare WiFi-CPU halt that kills
++	 * the link on HERA. Corroborated: dcxo_dpll.c sys_shut_down also uses 0x16101000.)
++	 */
++	u32 val;
++
++	atbm_printk_err("atbm_reset_lmc_cpu: AT+REBOOT-equiv SMU reset (sys_shut_down 0x16101000)\n");
++
++	/* system_reboot preamble: commanded-reboot latch (fw 0xa7af2 bit3 + helper bit5) */
++	if (atbm_ahb_read_32(hw_priv, 0x16101030, &val) == 0)
++		atbm_ahb_write_32(hw_priv, 0x16101030, val | 0x28);
++
++	/* reset core (fw 0xae264): IRQ quiesce + SMU/clock re-init (the DPLL re-init a bare
++	 * CPU-reset would be missing) */
++	atbm_ahb_write_32(hw_priv, 0x16100008, 0xffffffff);
++	atbm_ahb_write_32(hw_priv, 0x161010b0, 0x00000000);
++	atbm_ahb_write_32(hw_priv, 0x161010ac, 0x00000fbf);
++	atbm_ahb_write_32(hw_priv, 0x161010a8, 0x000004bb);
++	atbm_ahb_write_32(hw_priv, 0x16101004, 0x01004000);
++
++	/* TRIGGER: 0x16101000 |= BIT(0) = sys_shut_down. The chip resets inside this write, so a
++	 * lost/failed SDIO ACK here is EXPECTED, not an error - never treat it as a retry cause. */
++	if (atbm_ahb_read_32(hw_priv, 0x16101000, &val) == 0)
++		(void)atbm_ahb_write_32(hw_priv, 0x16101000, val | 0x1);
++	else
++		(void)atbm_ahb_write_32(hw_priv, 0x16101000, 0x1);
++
++	mdelay(100);   /* let the SMU standby + power-cycle land */
+ 	return 0;
+ }
+ static void atbm_sdio_release_err_cmd(struct atbm_common	*hw_priv)
+@@ -1401,10 +1441,28 @@ static struct sdio_driver sdio_driver = {
+ 		.pm = &atbm_pm_ops,
+ 	}
+ };
++extern struct atbm_common *g_hw_priv;	/* defined in main.c; for atbm_hw_priv_dereference() below */
+ static int atbm_reboot_notifier(struct notifier_block *nb,
+ 				unsigned long action, void *unused)
+ {
+ 	atbm_printk_exit("atbm_reboot_notifier\n");
++	/*
++	 * Cinnado S2 reliable-reboot fix. A plain T23 warm reboot (jz_wdt_restart)
++	 * leaves the ATBM WiFi core RUNNING but stale: on the next boot the WSM either
++	 * wedges (no fresh STARTUP_IND) or the STA silently never reconnects (rssi 0
++	 * for ~7 min) -> WiFi dead on a wall-mounted camera. Fix: on a RESTART, reset
++	 * the ATBM too (replicates AT+REBOOT). Its master_power_on then re-cycles the
++	 * T23 => a fresh BOTH-chip cold boot, so STARTUP_IND + STA-connect are clean.
++	 * Do this while the SDIO/AHB window is still up, BEFORE atbm_sdio_exit().
++	 * SYS_RESTART only - SYS_POWER_OFF/HALT must power the board OFF, not reboot it.
++	 */
++	if (action == SYS_RESTART) {
++		struct atbm_common *hw_priv = atbm_hw_priv_dereference();
++		if (hw_priv) {
++			atbm_printk_err("atbm_reboot_notifier: SYS_RESTART -> ATBM SMU reset (both-chip cold boot)\n");
++			atbm_reset_lmc_cpu(hw_priv);
++		}
++	}
+ 	atomic_set(&g_wtd.wtd_term, 1);
+ 	atomic_set(&g_wtd.wtd_run, 0);
+ 	atbm_sdio_exit();
+diff --git a/hal_apollo/module_fs.c b/hal_apollo/module_fs.c
+old mode 100755
+new mode 100644
+index c8e431e..f3cff37
+--- a/hal_apollo/module_fs.c
++++ b/hal_apollo/module_fs.c
+@@ -1479,14 +1479,43 @@ static ssize_t atbm_module_show_backup_info(struct kobject *kobj,
+ }
+ static struct kobject *atbm_module_kobj = NULL;
+ 
++/*
++ * Cinnado S2: manual trigger + de-risk hook for the ATBM SMU reset (== AT+REBOOT).
++ *   echo 1 > /sys/.../atbmfs/atbm_smu_reset
++ * resets the ATBM WiFi core; its master_power_on then cold-boots BOTH chips. This
++ * is the exact primitive the reboot-notifier uses, exposed so it can be validated
++ * in isolation (no reboot path) before trusting it on every reboot.
++ */
++extern int atbm_reset_lmc_cpu(struct atbm_common *hw_priv);
++static ssize_t atbm_module_smu_reset_show(struct kobject *kobj,
++			     struct kobj_attribute *attr, char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE,
++		"write 1 to SMU-reset the ATBM (both-chip cold boot, == AT+REBOOT)\n");
++}
++static ssize_t atbm_module_smu_reset_store(struct kobject *kobj,
++			     struct kobj_attribute *attr, const char *buf, size_t count)
++{
++	struct atbm_common *hw_priv = atbm_hw_priv_dereference();
++	if (hw_priv) {
++		atbm_printk_err("atbm_smu_reset: user-triggered ATBM SMU reset\n");
++		atbm_reset_lmc_cpu(hw_priv);
++	} else {
++		atbm_printk_err("atbm_smu_reset: no hw_priv (chip not probed)\n");
++	}
++	return count;
++}
++
+ static struct kobj_attribute atbm_module_common_attr  = __ATTR(atbm_cmd, 0644,atbm_module_cmd_show,atbm_module_cmd_store);
+ static struct kobj_attribute atbm_module_sysinfo_attr = __ATTR(atbm_sys,  0444,atbm_module_show_system_info, NULL);
+ static struct kobj_attribute atbm_module_common_backup_attr = __ATTR(atbm_sys_backup,  0444,atbm_module_show_backup_info, NULL);
++static struct kobj_attribute atbm_module_smu_reset_attr = __ATTR(atbm_smu_reset, 0644,atbm_module_smu_reset_show,atbm_module_smu_reset_store);
+ 
+ static struct attribute *atbm_module_attribute_group[]= {
+ 	&atbm_module_common_attr.attr,
+ 	&atbm_module_common_backup_attr.attr,
+ 	&atbm_module_sysinfo_attr.attr,
++	&atbm_module_smu_reset_attr.attr,
+ 	NULL,
+ };
+ static struct attribute_group atbm_module_attr_group = {
