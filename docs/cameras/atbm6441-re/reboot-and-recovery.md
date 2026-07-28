@@ -1,11 +1,21 @@
 # Reboot-hang, remote recovery, and the WiFi-config-apply chain (Cinnado S2, 2026-07-28)
 
-> **✅ SOLVED (2026-07-28, later same day — supersedes the hibernate approach in §1).** The
-> reliable fix is **not** kernel hibernate. Root cause: the driver's AHB **SMU reset** (the RE'd
-> AT+REBOOT sequence, §2) only *lands* while WiFi/SDIO are **fully up** — once the shutdown's
-> wireless-stop scripts (`S36wireless`/`S38wpa_supplicant` → `ifdown wlan0`) have run, the AHB
-> write silently fails. So a kernel reboot-notifier or any post-teardown hook fires too late
-> (both were tried and both failed live).
+> **⚠️ PARTIAL / INTERMITTENT (2026-07-28) — improves the reboot-hang but does NOT reliably fix
+> it. Do not treat as production-safe.** The rcK SMU-reset hook below works when the ATBM is in a
+> **fresh / recently-reset state** (a reboot shortly after a boot — validated 4× via UART:
+> `flashIotBoot`→`T23 TPL`→WiFi). But it **intermittently, then deterministically, FAILS once the
+> ATBM has been running a while** (minutes of uptime): the driver's *fixed* AHB SMU sequence
+> stops landing (no `flashIotBoot` — 6 rapid retries all failed), so rcK falls through to
+> `reboot -f` → the T23 hangs. This is exactly the production scenario (a wall cam reboots after
+> long uptime via web-portal/OTA), so **the reliability requirement is NOT met.** Likely cause:
+> the driver replays a fixed SMU/clock sequence that only matches the ATBM's **boot-time clock
+> config**; after the ATBM enters low-power the SDIO→AHB channel/clock differs and the writes
+> don't take. **`AT+wmem` on COM11 always works** because the ATBM's *own CPU* runs its adaptive
+> `Hardware_Reboot` (§2) — but that's lab-only. **Reliable fix still OPEN**; candidates (all need
+> more RE): (a) a T23-reachable trigger for the ATBM's own `system_reboot`/`Hardware_Reboot`
+> (WSM/HIF/mailbox), (b) an MCU-driven power-cycle, (c) wake+restore the ATBM clock to boot config
+> before the SMU sequence. Note (earlier §1's hibernate/reboot-notifier is still dead/wrong — a
+> T23-only reset never recovers this board).
 >
 > **The fix:** `overlay/etc/init.d/rcK` fires the SMU reset **first**, right after "Going to
 > reboot!", before the F/K/S stop loop:
@@ -18,13 +28,15 @@
 > ```
 > The driver half — patch `package/all-patches/wifi-atbm6441/0101-cinnado-s2-smu-reset-reboot.patch`
 > — adds a **write-only sysfs trigger** `atbm_smu_reset` under `/sys/module/atbm6441_wifi_sdio/atbmfs/`
-> that calls `atbm_reset_lmc_cpu()` (the SMU sequence, §2). **Validated live: 5/5 clean `reboot`s,
-> 0 hangs** — UART shows each: `Going to reboot`→`SMU-reset ATBM`→`flashIotBoot`(ATBM reset)→
-> `T23 TPL`→`WIFI_CONNECT_SUCCESS@13 s`, reachable in ~36 s. A clean-rebuild confirms 0100+0101
-> apply from a pristine extract. Key: a **T23-only reset (WDT / armed HW-watchdog) never recovers
-> this board** — only resetting the ATBM (→ its `master_power_on`) does. §1's
-> `CONFIG_HIBERNATE_RESET` / reboot-notifier (commits e402188, f13a0a7) are now dead code, benign
-> (the SMU reset fires before `reboot -f` is ever reached).
+> that calls `atbm_reset_lmc_cpu()` (the SMU sequence, §2). This works **from a fresh-ATBM state**
+> (proven 4× via UART: `Going to reboot`→`SMU-reset ATBM`→`flashIotBoot`→`T23 TPL`→
+> `WIFI_CONNECT_SUCCESS@13 s`, reachable ~36 s) — but see the ⚠️ box above: it **fails once the
+> ATBM has aged** (the AHB writes stop landing; no `flashIotBoot`; hang). So this ships as a
+> partial improvement, **not** a reliability guarantee. A clean-rebuild confirms 0100+0101 apply
+> from a pristine extract. Key: a **T23-only reset (WDT / armed HW-watchdog) never recovers this
+> board** — only resetting the ATBM (→ its `master_power_on`) does. §1's `CONFIG_HIBERNATE_RESET` /
+> reboot-notifier (commits e402188, f13a0a7) are dead code, benign (the SMU reset fires before
+> `reboot -f` is ever reached).
 >
 > **Hung-cam recovery** (after the host goes silent the ATBM sleeps ~200 s; its AT console is dead
 > while asleep but it wakes ~every 300 s for DHCP): `scratchpad/recover_persistent.ps1` floods
