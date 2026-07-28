@@ -70,7 +70,12 @@ path (`mode=2`) restores on the next reboot. Chain fixed.
 
 ## 5. Proper fix (future, not shipped)
 
-Cleaner than the wrapper, both kernel-only:
+**Deployment note:** the `/bin/reboot` wrapper (§3) is live on *this unit's* overlay, but
+thingino's `BR2_ROOTFS_OVERLAY` (`configs/fragments/core.fragment`) is **global** — one `overlay/`
+for all cameras — and a hibernate `/bin/reboot` would **hang non-ATBM boards** (whose WDT reboot
+works fine). So there is no clean per-camera rootfs path; the *deployable* board-specific fix must
+be **kernel-based** (this camera already carries its own kernel fragment). Two kernel-only options,
+both cleaner than the wrapper:
 - **Enable the RTC** so the hibernate wake-alarm self-fires (set `RTCCR` RTCE bit in
   `hibernate_restart`, and `_machine_restart = jz_hibernate_restart`). Gives a fast (~5 s),
   self-contained wake independent of the ATBM — **if** the RTC actually counts on this board
