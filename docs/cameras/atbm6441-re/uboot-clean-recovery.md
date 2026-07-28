@@ -27,21 +27,27 @@ The **proven** recovery core is kept:
 is preserved verbatim in `uboot-wifi-eth-driver-WIP.md` and can be resumed later. The
 clean binary contains **zero** eth-driver code.
 
-## 2. RST-hold factory reset (NEW, `*** UNTESTED ***`)
+## 2. RST-hold factory reset (`*** HARDWARE-CONFIRMED 2026-07-28 ***`)
 
 `atbm_rst_recovery_check()` is called from `board_late_init()` on **every** boot:
 
 ```
 if (atbm_ensure_linked()) return;   // SDIO didn't come up -> normal boot
 if (!atbm_rst_pressed())  return;   // RST not held -> normal boot
-// RST held: kill MCU wdt, blink status LED (gpio49) while counting.
-// held >= 10 s -> run_command("run overlay_wipe")  (chunked factory reset + reboot)
-// released < 10 s -> normal boot
+// RST held: kill MCU wdt; steady 2 Hz blink of the RED LED (gpio50) while counting.
+// held >= 10 s -> 3 even 1s/1s white-floodlight (gpio60) blinks (confirm) ->
+//                 run_command("run overlay_wipe")  (chunked factory reset + reboot)
+// released < 10 s -> normal boot (gesture cancelled)
 ```
 
-- **LED** = T23 GPIO49 = port-B pin 17 (`led_b` in thingino.json). Driven with the raw
-  JZ GPIO regs at `GPIOB=0xb0011000` (INTC 0x18 / MASKS 0x24 / PAT1C 0x38 config;
-  PAT0S 0x44 high / PAT0C 0x48 low). **Assumed active-high** — verify on hardware.
+- **Feedback GPIOs** (T23 SoC port-B, raw JZ GPIO regs at `GPIOB=0xb0011000`: INTC 0x18 /
+  MASKS 0x24 / PAT1C 0x38 config; PAT0S 0x44 high / PAT0C 0x48 low; all **active-high**,
+  live-verified via `gpio set 50/60 1`):
+  - **RED status LED** = gpio50 = PB18 (the bi-colour LED's red half; gpio49 = blue).
+  - **White floodlight** = gpio60 = PB28 — the bright, unmistakable confirm signal.
+- **GPIO gotcha:** busybox `devmem` needs the **physical** address (`0x10011044`), not the
+  KSEG1 alias `0xb0011044` that U-Boot `mw` uses. `/sys/class/gpio` + debugfs gpio are
+  empty on this build; drive pins with the `gpio` command or physical-address `devmem`.
 - This mirrors thingino's own factory-reset convention `button_cmd_0=... run overlay_wipe`
   (`configs/common.uenv.txt:3`). thingino's *standard* button handler reads a **SoC**
   GPIO, which does not exist for this camera — RST is on the **ATBM MCU** — so this
