@@ -12,7 +12,7 @@ new file mode 100755
 index 0000000..1111111
 --- /dev/null
 +++ b/board/ingenic/isvp-t23/atbm_wdt.c
-@@ -0,0 +1,782 @@
+@@ -0,0 +1,789 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * ATBM6441 / Z7682 MCU hardware-watchdog control over SDIO (MSC1) from U-Boot.
@@ -597,44 +597,51 @@ index 0000000..1111111
 +	return ((v >> ATBM_KEY0_BIT) & 1) ? 0 : 1;
 +}
 +
-+/* ---- status LED (T23 GPIO49 = port B pin 17), JZ GPIO regs @ GPIOB=0xb0011000:
++/* ---- factory-reset feedback GPIOs (T23 port B, JZ GPIO regs @ GPIOB=0xb0011000):
 + * config output = INTC(0x18)+MASKS(0x24 gpio-mode)+PAT1C(0x38 output);
-+ * level = PAT0S(0x44) high / PAT0C(0x48) low. LED assumed active-high. ---- */
-+#define LED_STATUS   (1u << 17)   /* gpio49 = PB17 */
-+static void led_cfg(void) { wr(GPIOB + 0x18, LED_STATUS); wr(GPIOB + 0x24, LED_STATUS); wr(GPIOB + 0x38, LED_STATUS); }
-+static void led(int on)   { wr(GPIOB + (on ? 0x44 : 0x48), LED_STATUS); }
++ * level = PAT0S(0x44) high / PAT0C(0x48) low. Active-high, live-verified 2026-07-28
++ * (`gpio set 50 1` = red on, `gpio set 60 1` = floodlight on). ---- */
++#define LED_RED     (1u << 18)   /* gpio50 = PB18, red half of the bi-colour status LED */
++#define LED_FLOOD   (1u << 28)   /* gpio60 = PB28, white floodlight */
++static void gpio_out_cfg(u32 m) { wr(GPIOB + 0x18, m); wr(GPIOB + 0x24, m); wr(GPIOB + 0x38, m); }
++static void gpio_hi(u32 m)      { wr(GPIOB + 0x44, m); }
++static void gpio_lo(u32 m)      { wr(GPIOB + 0x48, m); }
 +
 +/*
 + * Boot-time RST recovery gesture (called from board_late_init, before autoboot).
-+ * If the RST button (ATBM GPIO 0x16800020 bit17, active-low) is HELD at power-on,
-+ * blink the status LED while counting; hold 10 s -> FACTORY RESET via the chunked
-+ * `overlay_wipe` env (sf-erase the overlay/data region + reset). Release before
-+ * 10 s -> normal boot. Reading RST needs the ATBM SDIO link; if it can't come up,
-+ * or RST isn't held, we return immediately (normal boot, MCU wdt untouched).
-+ * UNTESTED ON HARDWARE 2026-07-27: verify LED pin/polarity + the 10 s reset path.
++ * If the RST button (ATBM GPIO 0x16800020 bit17, active-low) is HELD at power-on:
++ *   - blink the RED status LED (gpio50) while counting toward 10 s;
++ *   - release before 10 s -> normal boot (gesture cancelled);
++ *   - hold 10 s -> THREE ~2 s white floodlight (gpio60) blinks to confirm, then
++ *     FACTORY RESET via the chunked `overlay_wipe` env (sf-erase data/overlay + reset).
++ * Reading RST needs the ATBM SDIO link; if it can't come up, or RST isn't held, we
++ * return immediately (normal boot, MCU wdt untouched). Feedback GPIOs live-verified
++ * 2026-07-28 (red=gpio50, floodlight=gpio60, both active-high).
 + */
 +void atbm_rst_recovery_check(void)
 +{
-+	int held = 0, on = 0, period;
++	int held = 0, secs = 0, i;
 +	if (atbm_ensure_linked()) return;          /* SDIO down -> normal boot */
 +	if (!atbm_rst_pressed()) return;           /* RST not held -> normal boot */
 +	printf("\natbm: RST held at boot -> keep holding 10s for FACTORY RESET (release to cancel)\n");
 +	atbm_wdt_set(0);                           /* kill the ~14.5s MCU wdt for the window */
-+	led_cfg();
++	gpio_out_cfg(LED_RED); gpio_out_cfg(LED_FLOOD); gpio_lo(LED_FLOOD);
 +	while (atbm_rst_pressed()) {
-+		period = (held < 5000) ? 400 : (held < 8000) ? 200 : 100;  /* blink faster near 10s */
-+		led(on ^= 1);
-+		mdelay(period);
-+		held += period;
-+		if ((held % 1000) < period) printf("  atbm: RST held %ds ...\n", held / 1000);
++		gpio_hi(LED_RED); mdelay(250);         /* steady, even 2 Hz RED blink while held */
++		gpio_lo(LED_RED); mdelay(250);
++		held += 500;
++		if (held / 1000 > secs) { secs = held / 1000; printf("  atbm: RST held %ds ...\n", secs); }
 +		if (held >= 10000) {
-+			printf("atbm: 10s -> FACTORY RESET: overlay wipe (chunked) + reboot\n");
-+			led(1);
++			printf("atbm: 10s -> FACTORY RESET confirmed: 3 floodlight blinks, then overlay wipe\n");
++			for (i = 0; i < 3; i++) {           /* 3 even 1s-on/1s-off floodlight blinks = confirmation */
++				gpio_hi(LED_FLOOD); mdelay(1000);
++				gpio_lo(LED_FLOOD); mdelay(1000);
++			}
 +			run_command("run overlay_wipe", 0);   /* chunked sf erase + reset */
 +			return;                               /* overlay_wipe resets; not reached */
 +		}
 +	}
-+	led(0);
++	gpio_lo(LED_RED);
 +	printf("atbm: RST released before 10s -> normal boot\n");
 +}
 +
