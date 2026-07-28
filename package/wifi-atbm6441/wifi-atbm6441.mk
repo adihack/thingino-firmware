@@ -102,6 +102,10 @@ define WIFI_ATBM6441_BUILD_CMDS
 		$(WIFI_ATBM6441_PKGDIR)/files/z7682_disable_wdt.c \
 		-L$(@D) -lrtos \
 		$(TARGET_LDFLAGS)
+	$(TARGET_CC) $(TARGET_CFLAGS) -o $(@D)/mcu_wdt_arm \
+		$(WIFI_ATBM6441_PKGDIR)/files/mcu_wdt_arm.c \
+		-L$(@D) -lrtos \
+		$(TARGET_LDFLAGS)
 	$(TARGET_CC) $(TARGET_CFLAGS) -o $(@D)/mcu_evt \
 		$(WIFI_ATBM6441_PKGDIR)/files/mcu_evt.c \
 		$(TARGET_LDFLAGS)
@@ -118,6 +122,8 @@ define WIFI_ATBM6441_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/lib/librtos.so
 	$(INSTALL) -D -m 0755 $(@D)/z7682_disable_wdt \
 		$(TARGET_DIR)/usr/bin/z7682_disable_wdt
+	$(INSTALL) -D -m 0755 $(@D)/mcu_wdt_arm \
+		$(TARGET_DIR)/usr/bin/mcu_wdt_arm
 	$(INSTALL) -D -m 0755 $(@D)/mcu_evt \
 		$(TARGET_DIR)/usr/bin/mcu_evt
 endef

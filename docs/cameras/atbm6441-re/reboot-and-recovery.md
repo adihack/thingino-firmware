@@ -1,5 +1,28 @@
 # Reboot-hang, remote recovery, and the WiFi-config-apply chain (Cinnado S2, 2026-07-28)
 
+> **✅ SOLVED (2026-07-29) — reliable both-chip reboot via the MCU master_wdt.** The driver's AHB
+> SMU poke (the ⚠️ approach below) is state-dependent and dies on an aged ATBM. The reliable
+> mechanism: **arm the ATBM/Z7682 `master_wdt` — `message_mgr` msg_id `0x14` (SET-PERIOD+START,
+> payload = u32 seconds) — over the very same `librtos` / `/dev/atbm_ioctl` bus that
+> `z7682_disable_wdt` uses to DELETE it (0x13) at boot.** When it fires unfed, the MCU's
+> master-power state machine runs `master_wdt_timer_cb` → `master_power_off` → *"reboot two
+> devices"* → `HI_SDIO_Host_Reboot`, cold-booting BOTH chips. It is **state-independent** — the
+> Z7682 is a separate always-on core, decoupled from the WiFi core's clock state — and the MCU
+> only needs the SDIO/WSM link at ARM time, then fires autonomously (nothing after can stop it).
+> **Validated 10/10, incl. 4 arms from aged states (238–3284 s uptime) where the SMU poke
+> deterministically fails** — each a clean both-chip cold boot, WiFi back in ~14 s, and a *clean*
+> `/proc/uptime` (SMU-reset boots corrupted it).
+>
+> Shipped: **`package/wifi-atbm6441/files/mcu_wdt_arm.c`** (`mcu_wdt_arm <seconds>`, built+installed
+> by the package exactly like `z7682_disable_wdt`) and **`overlay/etc/init.d/rcK`**, which after
+> `sync` runs `mcu_wdt_arm 5; sleep 15` as the **primary** reboot (orderly shutdown + `reboot -f`
+> demoted to fallback). UART of a real `reboot`: `arm MCU master_wdt` → `master_wdt_timer_cb` →
+> `flashIotBoot` → `T23 TPL` → `master_power_on` → `WIFI_CONNECT_SUCCESS`. **For WiFi *setup*,
+> prefer applying live (no reboot) — only a firmware update truly needs the reboot.** Footgun:
+> arm it while the system is HEALTHY; a 0x14 arm fired mid-SDIO-teardown once wedged the ATBM.
+>
+> (The ⚠️ box below is the earlier SMU-poke approach — partial, state-dependent — kept for context.)
+
 > **⚠️ PARTIAL / INTERMITTENT (2026-07-28) — improves the reboot-hang but does NOT reliably fix
 > it. Do not treat as production-safe.** The rcK SMU-reset hook below works when the ATBM is in a
 > **fresh / recently-reset state** (a reboot shortly after a boot — validated 4× via UART:
