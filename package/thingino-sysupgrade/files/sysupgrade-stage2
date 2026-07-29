@@ -123,7 +123,9 @@ go_reboot() {
 	# Arm the MCU/Z7682 master_wdt for a reliable BOTH-chip reboot into the new
 	# firmware. Guarded, so it is a no-op on boards without the tool; the
 	# echo-wdt / reboot-f below remain the fallback.
-	if [ -x /usr/bin/mcu_wdt_arm ]; then
+	# mcu_wdt_arm (static) was copied into $PATH (/tmp/sysupgrade) by stage1 so it
+	# survives the rootfs (mtd3) erase; /usr/bin/mcu_wdt_arm is gone by now.
+	if command -v mcu_wdt_arm >/dev/null 2>&1; then
 		echo "Cinnado S2: arm MCU master_wdt -> both-chip reboot into new firmware"
 		mcu_wdt_arm 5
 		sleep 10

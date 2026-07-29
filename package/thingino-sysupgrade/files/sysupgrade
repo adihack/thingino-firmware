@@ -515,6 +515,11 @@ fi
 echo_c 112 "\nPrepare working directory"
 clone_app /bin/busybox
 clone_app /sbin/$stage2app
+# Cinnado S2 / ATBM6441: keep the STATIC mcu_wdt_arm in the workdir so stage2's
+# go_reboot can still arm the MCU master_wdt after the rootfs (mtd3) is erased -
+# a T23-only reset leaves the ATBM stale and WiFi dead after an OTA. Guarded, so
+# it is a no-op on boards without the tool.
+[ -x /usr/bin/mcu_wdt_arm ] && clone_app /usr/bin/mcu_wdt_arm
 for a in $bbapplets; do expand_bb $a; done
 
 echo_c 112 "\nPartitions"

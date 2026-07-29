@@ -102,9 +102,13 @@ define WIFI_ATBM6441_BUILD_CMDS
 		$(WIFI_ATBM6441_PKGDIR)/files/z7682_disable_wdt.c \
 		-L$(@D) -lrtos \
 		$(TARGET_LDFLAGS)
-	$(TARGET_CC) $(TARGET_CFLAGS) -o $(@D)/mcu_wdt_arm \
+	# mcu_wdt_arm is STATIC (librtos.c compiled in, no shared libs) so it keeps
+	# working after sysupgrade erases the rootfs - stage2 copies it into /tmp and
+	# go_reboot arms the master_wdt from there. See thingino-sysupgrade.
+	$(TARGET_CC) $(TARGET_CFLAGS) -static -o $(@D)/mcu_wdt_arm \
 		$(WIFI_ATBM6441_PKGDIR)/files/mcu_wdt_arm.c \
-		-L$(@D) -lrtos \
+		$(WIFI_ATBM6441_PKGDIR)/files/librtos.c \
+		-lpthread \
 		$(TARGET_LDFLAGS)
 	$(TARGET_CC) $(TARGET_CFLAGS) -o $(@D)/mcu_evt \
 		$(WIFI_ATBM6441_PKGDIR)/files/mcu_evt.c \
