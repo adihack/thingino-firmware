@@ -19,7 +19,12 @@ stage2app="sysupgrade-stage2"
 SD_CARD_ROOT="/mnt/mmcblk0p1"
 
 self=$(realpath $0)
-selfupdate="true"
+# Cinnado S2 / ATBM6441 fork: default OFF. The upstream self-update pulls
+# themactep's stage1+stage2, whose go_reboot uses a T23-only reset (echo wdt /
+# reboot -f) that leaves the ATBM stale -> WiFi dead / hang after an OTA. Our
+# shipped stage2 arms the MCU master_wdt for a reliable both-chip reboot; a
+# self-update would clobber that. (`-x` also forces this.)
+selfupdate="false"
 bbapplets="date echo flash_eraseall flashcp killall pidof reboot rm sh sleep sync tail"
 upgrade=""
 gestalt_app="/sbin/gestalt"
