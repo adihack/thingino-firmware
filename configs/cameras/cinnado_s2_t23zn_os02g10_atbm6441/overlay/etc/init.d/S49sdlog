@@ -1,0 +1,64 @@
+#!/bin/sh
+# S49sdlog - Cinnado S2 SD-card boot diagnostic logger.
+#
+# A field camera can lose WiFi (no network, and often no UART), which makes it
+# undiagnosable. If a FAT SD card is present, this appends a per-boot diagnostic
+# bundle to it so the card can be pulled and read on a PC. It never blocks boot
+# (backgrounded), no-ops cleanly when no card is present, and redacts secrets.
+#
+# Runs late (after the WiFi bring-up S36/S38/S40) and waits a bit more for the
+# link to settle, so it captures the FINAL WiFi state. On a boot that reboots
+# early (e.g. the warm-attach SMU cold-boot fires during driver init at S09mmc),
+# this simply doesn't run for that boot; it runs on the next, settled boot -
+# whose dmesg still shows whether the cold path (WSM init done) or the warm
+# fallback (SMU cold-boot did not fire) was taken.
+
+[ "$1" = "start" ] || exit 0
+
+DEV=/dev/mmcblk0p1
+[ -b "$DEV" ] || exit 0
+
+(
+	# give the WiFi stack up to ~40s to load the driver + associate / open the AP
+	i=0
+	while [ $i -lt 40 ]; do
+		ip -4 addr show wlan0 2>/dev/null | grep -q 'inet ' && break
+		i=$((i + 1))
+		sleep 1
+	done
+
+	SD=/tmp/.sdlog
+	mkdir -p "$SD"
+	mount -t vfat "$DEV" "$SD" 2>/dev/null || { rmdir "$SD" 2>/dev/null; exit 0; }
+	LOG="$SD/thingino-diag.log"
+
+	N=$(cat "$SD/.diagboot" 2>/dev/null)
+	N=$((N + 1))
+	echo "$N" > "$SD/.diagboot"
+
+	KO=$(ls /usr/lib/modules/*/extra/atbm6441_wifi_sdio.ko 2>/dev/null | head -1)
+	{
+		echo ""
+		echo "################ BOOT #$N  $(date)  up=$(cut -d. -f1 /proc/uptime 2>/dev/null)s ################"
+		grep -hE "^IMAGE_ID=|^VERSION=" /etc/os-release 2>/dev/null
+		echo "driver .ko md5: $(md5sum "$KO" 2>/dev/null | cut -d' ' -f1)   SMU-fix present: $(strings "$KO" 2>/dev/null | grep -c atbm_smu_cold_reset)"
+		echo "lsmod: $(lsmod | grep -iE 'atbm|jzmmc' | awk '{print $1}' | tr '\n' ' ')"
+		echo "/dev/atbm_ioctl: $(ls -l /dev/atbm_ioctl 2>/dev/null || echo MISSING)"
+		echo "wlan0 link: $(ip -o link show wlan0 2>/dev/null || echo 'MISSING (driver did not create wlan0)')"
+		echo "wlan0 ipv4: $(ip -4 addr show wlan0 2>/dev/null | grep 'inet ' || echo NONE)"
+		echo "/proc/net/wireless: $(grep wlan0 /proc/net/wireless 2>/dev/null || echo none)"
+		echo "run flags: $(ls /run/ 2>/dev/null | grep -iE 'mode|portal|ap' | tr '\n' ' ')"
+		echo "wpa mode (secrets redacted): $(sed -E 's/psk=.*/psk=<redacted>/' /etc/wpa_supplicant.conf 2>/dev/null | grep -iE 'ssid|mode=|key_mgmt|disabled' | tr '\n' ' ')"
+		echo "--- ATBM / WiFi dmesg (this boot) ---"
+		dmesg | grep -iE 'atbm|wsm|hif|startup|warm attach|SMU cold|sys_shut|proceeding non-fatally|sta_conn|assoc|wlan|Buffer Number|No Descriptor|firmwareReady|rxseq|WSM init|master_power|new SDIO card|mmc1' | tail -90
+		echo "--- full dmesg tail ---"
+		dmesg | tail -45
+		echo "=== END BOOT #$N (up=$(cut -d. -f1 /proc/uptime 2>/dev/null)s) ==="
+	} >> "$LOG" 2>&1
+
+	sync
+	umount "$SD" 2>/dev/null
+	rmdir "$SD" 2>/dev/null
+) &
+
+exit 0
