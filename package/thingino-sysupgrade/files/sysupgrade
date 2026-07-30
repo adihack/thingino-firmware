@@ -25,7 +25,7 @@ self=$(realpath $0)
 # shipped stage2 arms the MCU master_wdt for a reliable both-chip reboot; a
 # self-update would clobber that. (`-x` also forces this.)
 selfupdate="false"
-bbapplets="date echo flash_eraseall flashcp killall pidof reboot rm sh sleep sync tail"
+bbapplets="date echo flash_eraseall flashcp killall pidof reboot rm sh sleep sync tail truncate stat"
 upgrade=""
 gestalt_app="/sbin/gestalt"
 

@@ -12,10 +12,46 @@ die() {
 	exit 1
 }
 
+# Byte offset where the data (config) partition starts = sum of the sizes of the
+# real partitions before it ("all" pseudo-partition skipped). Pure shell so it
+# works from the /tmp/sysupgrade PATH after the rootfs is gone.
+_data_offset() {
+	local d s e n off=0
+	while read -r d s e n; do
+		case "$d" in mtd*) : ;; *) continue ;; esac
+		n="${n%\"}"; n="${n#\"}"
+		case "$n" in
+			data) echo "$off"; return 0 ;;
+			all) : ;;
+			*) off=$((off + 0x$s)) ;;
+		esac
+	done < /proc/mtd
+	echo 0
+}
+
 flash_firmware() {
 	echo_c 112 "\nFlashing firmware to $mtd_dev"
-	flash_eraseall $mtd_dev
-	flashcp -v $fw_file $mtd_dev
+	# Cinnado S2 / ATBM6441: the data (config) partition (/overlay = mtd4, jffs2 -
+	# holds WiFi creds + settings) is the top of the "all" image. A plain
+	# flash_eraseall+flashcp of the whole 16MB wipes it, so the camera comes up in
+	# AP mode after every OTA and you lose contact with it. Instead, when the image
+	# reaches into the data partition (a full "all" image), truncate it in place to
+	# just before data and flashcp WITHOUT flash_eraseall - flashcp erases only the
+	# region it writes, so boot+env+kernel+rootfs update and data (config) stays
+	# intact. _data_offset is pure shell (no external tools) so it can't silently
+	# fail into the erase-everything path. A smaller image (bootloader/kernel-only)
+	# does not reach data, so the full erase is safe there.
+	local data_off fw_size
+	data_off="$(_data_offset)"
+	fw_size="$(stat -c%s "$fw_file" 2>/dev/null || echo 0)"
+	if [ "${data_off:-0}" -gt 0 ] && [ "${fw_size:-0}" -gt "$data_off" ]; then
+		echo_c 112 "Preserving data/config partition (data starts at $data_off): flashing 0..$data_off only"
+		truncate -s "$data_off" "$fw_file" || die "truncate failed - refusing to erase config"
+		flashcp -v "$fw_file" "$mtd_dev"
+	else
+		flash_eraseall "$mtd_dev"
+		flashcp -v "$fw_file" "$mtd_dev"
+	fi
 }
 
 stop_streamer() {
