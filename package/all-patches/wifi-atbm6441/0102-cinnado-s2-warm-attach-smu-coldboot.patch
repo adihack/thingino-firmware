@@ -1,0 +1,144 @@
+From: Cinnado S2 port <noreply@thingino>
+Subject: [PATCH] cinnado-s2: recover WiFi on a warm ATBM attach via an SMU cold-boot
+
+The ATBM6441 is battery-backed on the Cinnado S2 and keeps its firmware running
+across a T23-only reboot (fresh vendor->thingino flash, `echo hibernate`, a crash).
+On such a WARM attach the fresh driver never receives a STARTUP_IND -- the ATBM
+only emits it on its own 0->1 boot transition -- so wsm_caps.firmwareReady stays 0.
+The mid-session HIF ring cannot be re-synced host-side: TX force-syncs, but the
+device->host output-completion plane stays wedged, so confirms (get_mac, etc.)
+never return and wlan0 comes up dead (garbage MAC, no association). The stock
+timeout path then calls sbus_reset_chip, a bare SMU poke that cannot cold-boot a
+battery-backed chip, so it churns/strands. Net effect: no WiFi/AP after a warm
+boot until a manual power-cycle (impossible: the battery is sealed in the IP65
+housing).
+
+Fix: detect the warm attach early (STARTUP_IND still absent after ~1s -- a cold
+boot has it queued within one iteration) and recover the only reliable way that
+does not depend on the wedged HIF: drive the ATBM SMU sys_shut_down sequence over
+the SDIO->AHB MMIO window (atbm_smu_cold_reset). These 0x1610xxxx are MMIO
+peripheral registers reachable from the T23 via atbm_direct_write_reg_32 (the
+ATBM DTCM at 0x80xxxx is not). Writing sys_shut_down triggers the ATBM master-
+power state machine to "reboot two devices" -> BOTH chips cold-boot -> the ATBM
+emits a real STARTUP_IND on the next boot -> the normal cold path brings WiFi up.
+This mirrors the lab-proven AT-console recovery (AT+wmem to the same regs); the
+AHB-side write triggers the cold-boot identically. A bare poke of 0x16101000
+alone does NOT work -- the full clock/reset-enable arming sequence is required.
+
+Cost: one ~40s reboot on the rare warm boot (fresh flash / T23-only reboot).
+Normal thingino reboots (rcK) already cold-boot both chips via the MCU master_wdt,
+so they never hit this path, and a genuine cold boot never reaches WARM_GRACE.
+
+--- a/hal_apollo/hwio_sdio.h
++++ b/hal_apollo/hwio_sdio.h
+@@ -218,6 +218,8 @@
+                      u32 buf_len);
+ int atbm_direct_read_reg_32(struct atbm_common *hw_priv, u32 addr, u32 *val);
+ int atbm_direct_write_reg_32(struct atbm_common *hw_priv, u32 addr, u32 val);
++/* Cinnado S2 warm-attach recovery: cold-boot both chips via the ATBM SMU over AHB. */
++int atbm_smu_cold_reset(struct atbm_common *hw_priv);
+ int __atbm_irq_enable(struct atbm_common *priv, int enable);
+ void __atbm_irq_dbgPrint(struct atbm_common *priv);
+ int atbm_direct_read_unlock(struct atbm_common *hw_priv, u32 addr, u32 *val);
+--- a/hal_apollo/hwio_sdio.c
++++ b/hal_apollo/hwio_sdio.c
+@@ -814,6 +814,39 @@
+ out1:
+ 	return ret;
+ }
++
++/*
++ * WARM-ATTACH recovery (Cinnado S2). Cold-boot BOTH chips (T23 + ATBM6441) from
++ * the T23 side with NO working WSM/HIF link, by driving the ATBM SMU
++ * sys_shut_down sequence over the SDIO->AHB MMIO window. These 0x1610xxxx are
++ * MMIO peripheral registers reachable via atbm_direct_*_reg_32 (the ATBM's DTCM
++ * at 0x80xxxx is NOT reachable that way, but the SMU is). This mirrors the
++ * lab-proven AT-console recovery (AT+wmem to the same regs): writing
++ * sys_shut_down triggers master_power_off -> the ATBM master-power state machine
++ * "reboots two devices" -> both chips cold-boot -> the ATBM emits a real
++ * STARTUP_IND on the next boot -> normal cold path -> WiFi. A bare poke of
++ * 0x16101000 alone does NOT work (that was the old atbm_reset_lmc_cpu); the full
++ * clock/reset-enable arming sequence below is required. Fire-and-forget: the
++ * board power-cycles a moment after the final write, so this does not return in
++ * practice.
++ */
++int atbm_smu_cold_reset(struct atbm_common *hw_priv)
++{
++	u32 v00 = 0, v30 = 0;
++
++	atbm_printk_always("atbm_smu_cold_reset: SMU sys_shut_down -> cold-boot both chips\n");
++	atbm_direct_read_reg_32(hw_priv, 0x16101000, &v00);
++	atbm_direct_read_reg_32(hw_priv, 0x16101030, &v30);
++	atbm_direct_write_reg_32(hw_priv, 0x16101030, v30 | 0x28);
++	atbm_direct_write_reg_32(hw_priv, 0x16100008, 0xffffffff);
++	atbm_direct_write_reg_32(hw_priv, 0x161010b0, 0x0);
++	atbm_direct_write_reg_32(hw_priv, 0x161010ac, 0xfbf);
++	atbm_direct_write_reg_32(hw_priv, 0x161010a8, 0x4bb);
++	atbm_direct_write_reg_32(hw_priv, 0x16101004, 0x01004000);
++	atbm_direct_write_reg_32(hw_priv, 0x16101000, v00 | 0x1);
++	return 0;
++}
++
+ int atbm_direct_write_unlock(struct atbm_common *hw_priv, u32 addr, u32 val)
+ {
+     int ret;
+--- a/hal_apollo/main.c
++++ b/hal_apollo/main.c
+@@ -631,27 +631,40 @@
+ #endif
+ //fix mstar CVT suspend bug,in CVT mstar suspend wait_event_interruptible_timeout sometime will not delay
+ 	{
+-		int loop =0;
++		int loop = 0;
++		const int WARM_GRACE = 33;   /* ~1s at ~30ms/iteration */
++		/*
++		 * WARM-ATTACH detect + recovery (Cinnado S2). On a cold boot the ATBM
++		 * queues its STARTUP_IND before we get here, so firmwareReady flips at
++		 * ~iteration 1. Reaching WARM_GRACE (~1s) WITHOUT it means the ATBM
++		 * firmware is already running (battery-backed; a T23-only reboot leaves
++		 * it up) and will NEVER re-emit a STARTUP_IND. Its mid-session HIF ring
++		 * cannot be re-synced host-side (TX force-syncs, but the device output-
++		 * completion plane stays wedged so device->host confirms never return),
++		 * and sbus_reset_chip is only a bare SMU poke that cannot cold-boot a
++		 * battery-backed chip -> the old reload_fw path just churns and strands.
++		 * So recover the CLEAN, proven way: drive the ATBM SMU sys_shut_down over
++		 * the SDIO->AHB MMIO window to cold-boot BOTH chips. On the next boot the
++		 * ATBM emits a real STARTUP_IND -> normal cold path -> WiFi. One ~40s
++		 * reboot on the rare warm boot (fresh flash / T23-only reboot); normal
++		 * rcK reboots already cold-boot both chips so they never land here.
++		 */
+ 		atbm_printk_always("mdelay wait wsm_startup_done  !!\n");
+ 		while(hw_priv->wsm_caps.firmwareReady !=1){
+ 			mdelay(10);
+ 			schedule_timeout_interruptible(msecs_to_jiffies(20));
+-			if(loop++>300){
+-				atbm_printk_init("wait_event_interruptible_timeout wsm_startup_done timeout ERROR !!\n");
+-				#if (ATBM_WIFI_PLATFORM == PLATFORM_ANKAI_RTOS)
+-				goto __wait_start_up;
+-				#endif
+-				atbm_monitor_pc(hw_priv);
+-				if(hw_priv->sbus_ops->sbus_reset_chip){
+-						atbm_printk_err("reload fw\n");
+-						if(hw_priv->sbus_ops->irq_unsubscribe)
+-							hw_priv->sbus_ops->irq_unsubscribe(hw_priv->sbus_priv);
+-						hw_priv->sbus_ops->sbus_reset_chip(hw_priv->sbus_priv);
+-						goto reload_fw;
+-				}else {
+-					err = -ETIMEDOUT;
+-					goto err3;
+-				}
++			if(loop++ >= WARM_GRACE){
++				atbm_printk_always("atbm: STARTUP_IND timeout (~1s) -> warm attach, SMU cold-boot both chips\n");
++				atbm_smu_cold_reset(hw_priv);
++				/* The board power-cycles a moment after the SMU write, so this
++				 * mdelay is normally cut short by the reboot. If it ever survives,
++				 * the SMU reset did not fire: proceed non-fatally (module loads,
++				 * wlan0 may be down) instead of wedging, and let the next boot or
++				 * the userspace recovery retry. */
++				mdelay(4000);
++				atbm_printk_err("atbm: SMU cold-boot did not fire within 4s -> proceeding non-fatally\n");
++				hw_priv->wsm_caps.firmwareReady = 1;
++				break;
+ 			}
+ 		}
+ 	}
