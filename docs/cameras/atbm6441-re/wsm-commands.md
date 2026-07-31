@@ -205,6 +205,15 @@ nothing to the scan. The v5 "stop" earlier was a state coincidence + a malformed
 frame (see CRC bug below). **Do not use 0x2b for stop-scan.**
 
 ### THE reliable host lever = tear down the STA → AP mode = msg `0x40` (start_ap)
+
+> **[LIVE CONFIRMED 2026-07-31]** From Linux this is `mcu_test --wifi_start_ap="<ssid>"` (msg
+> 0x40 + SSID payload; frame CRC computed by `librtos rtos_cmd_send`). It made the config-portal
+> AP visible + connectable on a phone and drove `wlan0` to `LOWER_UP` via the S38 path. The
+> empty-SSID caveat below is real — `--send-raw=64` (no payload) does NOT beacon — and opcode 12
+> (the old `--send-raw=12`) is UNDEFINED, a no-op. Fix shipped in commit `a7e6f1e`
+> (`atbm6461-tool` `--wifi_start_ap`/`--wifi_stop_ap` + `S38wpa_supplicant`). Full write-up:
+> `cinnado_s2_atbm6441.md` §4.3.
+
 - `0x40` handler `0xab070`: logs `wifi_start_ap:%s`, memcpy's the SSID into the
   36-byte AP-cfg buffer `0x8099b8` (gp+0x2038), posts internal event `0x1031`.
 - event task `0xab4ac` → dispatcher `0xab15c` → table `0xab184` idx 0x30 →

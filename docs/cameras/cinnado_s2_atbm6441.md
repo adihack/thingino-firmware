@@ -248,7 +248,7 @@ pinned from `mcu_test`/`lp_mgr` disassembly and, where marked [LIVE], exercised 
 | 2 | 0x02 | `wifi_connect` | | [RE] |
 | 9 | 0x09 | `pir_enable` | required before PIR events flow | [LIVE] |
 | 10 | 0x0A | `pir_disable` | | [RE] |
-| 12 | 0x0C | `wifi_set_ap_open` | **wrong channel for AP** — see §11 | [RE] |
+| 12 | 0x0C | ~~`wifi_set_ap_open`~~ **BOGUS** | opcode 12 is UNDEFINED in the jump table; old `--send-raw=12` was a no-op returning zeros. Real AP beacon = msg `0x40`, see §4.3 | [LIVE] |
 | 13 | 0x0D | `set_detect_range` | PIR sensitivity/threshold | [RE] |
 | 18 | 0x12 | `wdt_enable` | powers the WDT block; does **not** arm | [LIVE] |
 | 19 | 0x13 | `wdt_disable` | no arg. **The recovery-critical opcode.** | [LIVE] |
@@ -259,6 +259,8 @@ pinned from `mcu_test`/`lp_mgr` disassembly and, where marked [LIVE], exercised 
 | 36 | 0x24 | `version` | returns `1.2.5u1` | [LIVE] |
 | 52 | 0x34 | `factory_reset` | **destructive** | [RE] |
 | 59 | 0x3B | `set_rtc_mode` | | [RE] |
+| 64 | 0x40 | `wifi_start_ap` | **starts + beacons the AP** — MUST be sent WITH a non-empty SSID payload (empty aborts). THE config-portal trigger, see §4.3 | [LIVE] |
+| 65 | 0x41 | `wifi_stop_ap` | stops the AP beacon | [LIVE] |
 | 67 | 0x43 | floodlight power *notification* | accounting only — does **not** drive the LED | [LIVE] |
 | 68/69 | | `get/set_bat_inc_interval` | | [RE] |
 | — | | `master_poweroff`, `wifi_master_poweroff`, `ble_start/stop`, `upgrade_fw`, `set_pir_type` | wired in `mcu_test`; **poweroff/upgrade are destructive** | [RE] |
@@ -273,6 +275,46 @@ mcu_test --version                 # or --get_battery_status, --pir_enable, --wd
 mcu_test --send-raw=36             # raw opcode, DECIMAL, no payload
 ```
 From U-Boot: `atbm mcu <cmd_hex> [arg_hex]`, and `atbm wdt on|off`.
+
+---
+
+### 4.3 Config-portal SoftAP — the real bring-up [LIVE CONFIRMED 2026-07-31]
+
+The ATBM6441 runs its AP inside its own firmware (beacon + DHCP + gateway on `192.168.43.1`;
+associated clients get `192.168.43.200`; the host portal sits at `192.168.43.2`). Bringing it up
+needs BOTH planes:
+
+1. **Configure** the SSID/channel over the WiFi-core (plane A / WSM ioctls) with
+   `atbm_softap <ssid> <chan>`: `CLEAR_WIFI_CFG → WIFI_MODE=AP → SET_COUNTRY → WIFI_CHANNEL →
+   AP_CFG(ssid)`. All return 0, but this **alone does not beacon**.
+2. **Start the beacon** over the MCU (plane B / `message_mgr` general-cmd `0x003A`) with **msg
+   `0x40` (`wifi_start_ap`) carrying the SSID as its payload**. Handler `0xab070` memcpy's the
+   payload into its 36-byte AP-cfg buffer, deauths the STA, flips the vif STA→AP and beacons.
+   `msg 0x41` = `wifi_stop_ap`.
+
+**The bug (fixed in commit `a7e6f1e`):** `start_atbm_softap` fired `mcu_test --send-raw=12` as the
+"open AP" step. **Opcode 12 does not exist** in the firmware jump table (§14.3: …`0x0a`
+PIR-disable, then unlabelled/`set_detect_range`), so it was a no-op returning 256 zero bytes. And
+`--send-raw=64` (the *right* opcode) also fails, because `--send-raw` carries **no payload** and
+the `0x40` handler treats an empty payload as an empty SSID — which **aborts** the bring-up. So
+the AP was configured but never beaconed (`wlan0` stayed `NO-CARRIER`, `hostevent bssid
+00:00:00:00:00:00`).
+
+**The fix:** `mcu_test --wifi_start_ap="<ssid>"` sends msg `0x40` *with* the SSID payload; the frame
+CRC is computed by `librtos rtos_cmd_send` (same path `--wifi_connect` uses — which is why
+STA-with-payload always worked). `--wifi_stop_ap` sends `0x41`. `S38wpa_supplicant`'s
+`start_atbm_softap` now calls `--wifi_start_ap="$ssid"`.
+
+**Live proof:** `--wifi_start_ap="THINGINO-TESTAP"` made the AP visible + connectable on a phone
+(the broadcast SSID matched the payload); driving the real S38 path brought `wlan0` to `LOWER_UP`
+(carrier up — was `NO-CARRIER` under op12) with the portal at `http://192.168.43.2`. It fails
+**identically on every unit** → a wrong-command bug, **not** per-camera ATBM/MCU state, so the
+no-open stock→Thingino conversion path is unaffected.
+
+> Signal caveat: the beacon is generated inside the ATBM firmware, *below* the Linux netdev, so
+> `wlan0` TX counters and `bssid` are NOT reliable "is it beaconing" signals from the T23 side.
+> `LOWER_UP`/`carrier` after the full S38 path is a good signal; a scan from another device is
+> definitive.
 
 ---
 
@@ -745,10 +787,13 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
    And a warm reboot leaves the MCU/WSM in a state where WSM startup can hang
    (`mdelay wait wsm_startup_done`) — **module changes need a COLD power cycle**. [LIVE]
 6. **Do not `rmmod` the atbm driver** — it hangs in D-state. [LIVE]
-7. **AP config must go over the WiFi-core channel, not the MCU channel.** SoftAP is
-   `WSM 0x000D (set_wifimode AP)` → `WSM 0x000E (ap_cfg)`, in that order. Sending `0x000E`
-   without `0x000D` hangs; routing AP through MCU opcode 12 / WSM `0x003A` hangs (wrong
-   subsystem). The resident firmware *is* the hostapd — do not run upstream hostapd. [RE]
+7. **SoftAP needs BOTH planes; the beacon-start is an MCU command.** [CORRECTED 2026-07-31 — see
+   §4.3] Configure the SSID/channel over the WiFi-core (`atbm_softap`: WSM `0x000D`
+   set_wifimode=AP → `0x000E` ap_cfg, in that order — `0x000E` without `0x000D` hangs), THEN
+   start the beacon over the MCU with `mcu_test --wifi_start_ap="<ssid>"` (msg `0x40`, **SSID as
+   payload**). The earlier "route AP through MCU opcode 12" advice was wrong twice over: opcode 12
+   doesn't exist, and a payload-less send leaves the SSID empty (aborts the bring-up). The
+   resident firmware *is* the hostapd — do not run upstream hostapd. [LIVE]
 8. **Autoboot is only ~2 s** (`Hit any key to stop autoboot: 1` → `0`) — a serial catcher must
    trigger on the boot banner, not on a wall-clock guess. [LIVE]
 
