@@ -37,6 +37,15 @@ BR2_PACKAGE_WIFI=y
 BR2_PACKAGE_WIFI_ATBM6441=y
 BR2_PACKAGE_ATBM6461_TOOLS=y
 BR2_PACKAGE_THINGINO_WPA_SUPPLICANT_WEXT=y
+# VPN (2026-07-31): bundle ZeroTier-One as a STANDALONE package, KEEPING the default WireGuard
+# VPN choice. The thingino-vpn "choice" is only a build-time flash-saver (Kconfig choice); there
+# is no runtime exclusivity - wireguard (S42wireguard) and zerotier (S90zerotier) are independent
+# services, so shipping both makes them switchable at runtime from the web UI. zerotier-one is
+# self-contained (binary + S90zerotier + /etc/zerotier.json). Deps (libstdcpp + threads) satisfied.
+# Grows rootfs ~3-4MB; layout auto-sizes (data/overlay shrinks to the leftover, still mounted +
+# usable). NOTE: a bigger rootfs changes the U-Boot-compiled mtdparts -> needs a full flash (incl
+# U-Boot), not an au_os incremental update.
+BR2_PACKAGE_ZEROTIER_ONE=y
 BR2_SENSOR_1_NAME="os02g10"
 BR2_INGENIC_SOC_MODEL="t23zn"
 BR2_THINGINO_AUDIO=y
@@ -50,5 +59,12 @@ BR2_THINGINO_LED_R_GPIO=50
 BR2_THINGINO_RMEM_MB=18
 BR2_THINGINO_SDCARD=y
 FLASH_SIZE_MB=16
+# FIXED partition layout (2026-07-31): pin kernel=2MB + rootfs=8MB so the data/overlay partition
+# sits at a STABLE offset (0xA60000) and firmware updates preserve WiFi/config (au_os keeps data
+# only when its offset doesn't move). rootfs 8MB = current ~5MB (with ZeroTier) + headroom; data =
+# the remaining ~5.76MB, mounted + usable. board.mk includes this defconfig as a makefile, so these
+# plain vars reach the Makefile's KERNEL_PARTITION_SIZE/ROOTFS_PARTITION_SIZE override.
+KERNEL_PARTITION_KB=2048
+ROOTFS_PARTITION_KB=8192
 BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_THINGINO_PATH)/configs/cameras/cinnado_s2_t23zn_os02g10_atbm6441/cinnado_s2_t23zn.kernel.config"
 BR2_ISP_PRINT_LEVEL_0=y

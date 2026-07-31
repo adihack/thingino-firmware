@@ -321,8 +321,12 @@ DATA_BIN_SIZE_ALIGNED = $(shell echo $$((($(DATA_BIN_SIZE) + $(ALIGN_BLOCK) - 1)
 # fixed size partitions
 U_BOOT_PARTITION_SIZE := $(shell echo $$(($(U_BOOT_SIZE_KB) * 1024)))
 UB_ENV_PARTITION_SIZE := $(shell echo $$(($(UB_ENV_SIZE_KB) * 1024)))
-KERNEL_PARTITION_SIZE = $(KERNEL_BIN_SIZE_ALIGNED)
-ROOTFS_PARTITION_SIZE = $(ROOTFS_BIN_SIZE_ALIGNED)
+# Optional per-camera FIXED partition sizes (in KB, from the camera defconfig, which board.mk
+# includes as a makefile). When set they override the content-derived aligned sizes, PINNING the
+# data/overlay offset so it stays put across firmware updates (au_os preserves config only when
+# the data partition does not move). Unset => auto-size to the aligned binary (original behaviour).
+KERNEL_PARTITION_SIZE = $(if $(KERNEL_PARTITION_KB),$(shell echo $$(($(KERNEL_PARTITION_KB) * 1024))),$(KERNEL_BIN_SIZE_ALIGNED))
+ROOTFS_PARTITION_SIZE = $(if $(ROOTFS_PARTITION_KB),$(shell echo $$(($(ROOTFS_PARTITION_KB) * 1024))),$(ROOTFS_BIN_SIZE_ALIGNED))
 
 export U_BOOT_PARTITION_SIZE
 export UB_ENV_PARTITION_SIZE
@@ -769,6 +773,8 @@ else
 	@$(ORANGE) "Device IP: $(CAMERA_IP_ADDRESS)"
 	@echo ""
 	@if [ $(DATA_BIN_SIZE) -gt $(DATA_PARTITION_SIZE) ]; then $(RED) "DATA PARTITION OVERFLOW"; fi
+	@if [ $(ROOTFS_BIN_SIZE) -gt $(ROOTFS_PARTITION_SIZE) ]; then $(RED) "ROOTFS PARTITION OVERFLOW ($(ROOTFS_BIN_SIZE) > $(ROOTFS_PARTITION_SIZE)) - raise ROOTFS_PARTITION_KB"; fi
+	@if [ $(KERNEL_BIN_SIZE) -gt $(KERNEL_PARTITION_SIZE) ]; then $(RED) "KERNEL PARTITION OVERFLOW ($(KERNEL_BIN_SIZE) > $(KERNEL_PARTITION_SIZE)) - raise KERNEL_PARTITION_KB"; fi
 	@if [ $(FIRMWARE_BIN_FULL_SIZE) -gt $(FLASH_SIZE) ]; then $(RED) "OVERSIZE"; fi
 	@echo "Image: $(FIRMWARE_BIN_FULL)"
 endif
