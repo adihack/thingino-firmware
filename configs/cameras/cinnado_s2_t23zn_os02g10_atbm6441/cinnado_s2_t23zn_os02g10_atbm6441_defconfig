@@ -41,6 +41,12 @@ BR2_SENSOR_1_NAME="os02g10"
 BR2_INGENIC_SOC_MODEL="t23zn"
 BR2_THINGINO_AUDIO=y
 BR2_THINGINO_AUDIO_GPIO=63
+# Status LEDs (2026-07-31): register the two indicator GPIOs with the kernel leds-gpio
+# driver so /sys/class/leds/led_b (49, status) + led_r (50) exist and Thingino's
+# S00blink/S99led framework drives them. Both active-HIGH (1=on, verified live), so no
+# _ACTIVE_LOW. Names match this camera's thingino.json gpio map. See docs §6.
+BR2_THINGINO_LED_B_GPIO=49
+BR2_THINGINO_LED_R_GPIO=50
 BR2_THINGINO_RMEM_MB=18
 BR2_THINGINO_SDCARD=y
 FLASH_SIZE_MB=16

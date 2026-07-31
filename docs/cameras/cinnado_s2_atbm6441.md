@@ -390,11 +390,16 @@ All of the following were validated on hardware (audible clicks, visible light, 
 | **61** | SD-card detect (`mmc_detect`) | input | [LIVE] |
 | PB8–PB14 | MSC1 SDIO to ATBM6441 | function 1, see §3.1 | [LIVE] |
 
-**What thingino currently claims** (`/sys/kernel/debug/gpio`, live): only `18 sensor_reset`,
-`58 sysfs`, `61 mmc_detect`, `62 sysfs`, `63 gpio_spk_en`, `64 sysfs`.
-**`gpio60` (floodlight) and `gpio49`/`gpio50` (LEDs) are completely unclaimed** — nobody
-declares or drives them. That is the remaining integration work for manual light control, and
-it is plain GPIO work, **not** MCU work. [LIVE]
+**`gpio49`/`gpio50` are now registered as status LEDs** (2026-07-31): the defconfig declares
+`BR2_THINGINO_LED_B_GPIO=49` + `BR2_THINGINO_LED_R_GPIO=50` (active-**high**, so no `_ACTIVE_LOW`),
+which drives the kernel `leds-gpio` platform device (`board_base.c` is patched at kernel-build
+time from these symbols — see `package/thingino-kopt`). Result: `/sys/class/leds/led_b` (gpio49,
+status) + `/sys/class/leds/led_r` (gpio50), driven by Thingino's `S00blink`/`S99led`/`led`
+framework — **blink while booting → solid `led_b` when ready** (`led.startup_indicator="b"` in
+this camera's `thingino.json`) → dark when off. Needs a kernel rebuild + reflash to take effect
+(the current field/test units drive gpio49 directly via `/sys/class/gpio` until reflashed).
+**`gpio60` (floodlight) is still unclaimed** — nobody declares or drives it; that is the
+remaining integration work for manual light control (plain GPIO, **not** MCU work). [LIVE]
 
 **The second physical LED is a hardware charge indicator**, not host-controllable. [LIVE]
 

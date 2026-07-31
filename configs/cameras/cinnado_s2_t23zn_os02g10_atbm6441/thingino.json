@@ -7,5 +7,8 @@
     "white": 60,
     "speaker": 63,
     "mmc_cd": 61
+  },
+  "led": {
+    "startup_indicator": "b"
   }
 }
