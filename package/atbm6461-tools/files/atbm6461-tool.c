@@ -23,6 +23,13 @@
 #define CMD_BLE_START             70
 #define CMD_BLE_STOP              71
 #define CMD_SET_PIR_TYPE          81
+/* Firmware message_mgr (msgid-reference.md): 0x40 start_ap / 0x41 stop_ap.
+ * start_ap memcpy's the payload as the AP SSID (1..32 ASCII) into the 36-byte
+ * AP-cfg buffer, deauths STA, flips the vif STA->AP and beacons. An EMPTY SSID
+ * aborts the bring-up, so this MUST be sent with a non-empty payload (the CRC is
+ * computed by librtos rtos_cmd_send, same as --wifi_connect). */
+#define CMD_WIFI_START_AP         64
+#define CMD_WIFI_STOP_AP          65
 
 int rtos_cmd_init(void);
 int rtos_cmd_send(int cmd_id, void *in_data, int in_len,
@@ -50,6 +57,8 @@ static void usage(const char *prog)
 	printf("supported options:\n");
 	printf("  --version\n");
 	printf("  --wifi_connect [=<ssid>:<password>]\n");
+	printf("  --wifi_start_ap [=<ssid>]\n");
+	printf("  --wifi_stop_ap\n");
 	printf("  --master_poweroff\n");
 	printf("  --wifi_master_poweroff\n");
 	printf("  --factory_reset\n");
@@ -282,6 +291,22 @@ static int handle_option(int argc, char **argv, int *index)
 			return wifi_connect(NULL);
 		return wifi_connect(value);
 	}
+	if (strcmp(name, "wifi_start_ap") == 0) {
+		int ret;
+
+		if (take_arg(argc, argv, index, &value) < 0 || !value ||
+		    !value[0]) {
+			puts("wifi_start_ap requires a non-empty SSID");
+			return -1;
+		}
+		ret = rtos_cmd_send(CMD_WIFI_START_AP, (void *)value,
+				    (int)strlen(value), NULL, NULL,
+				    RTOS_TIMEOUT_WIFI_MS);
+		printf("wifi_start_ap ssid=%s ret=%d\n", value, ret);
+		return ret < 0 ? -1 : 0;
+	}
+	if (strcmp(name, "wifi_stop_ap") == 0)
+		return send_no_payload(CMD_WIFI_STOP_AP);
 	if (strcmp(name, "master_poweroff") == 0 ||
 	    strcmp(name, "wifi_master_poweroff") == 0)
 		return rtos_cmd_master_poweroff();

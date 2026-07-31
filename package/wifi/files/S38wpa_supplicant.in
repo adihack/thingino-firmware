@@ -277,12 +277,15 @@ start_atbm_softap() {
 		echo "WARNING: atbm_softap failed" >&2
 	fi
 
-	# Trigger the Z7682 MCU to OPEN + beacon the AP (opcode 12 = wifi_set_ap_open, sent on the
-	# MCU general-cmd channel nr70). On this MCU-managed WiFi the WiFi-core AP_CFG above only
-	# WRITES the SSID config; this MCU command is what actually starts the AP beacon.
+	# Start + beacon the AP via the Z7682 MCU. The real trigger is message_mgr msg 0x40
+	# (wifi_start_ap) sent WITH the SSID as payload: the firmware memcpy's it into its AP-cfg
+	# buffer, flips the vif STA->AP and beacons (live-confirmed: the AP becomes visible +
+	# connectable). The previous --send-raw=12 was a non-existent opcode, and --send-raw
+	# carries no payload anyway -> an empty SSID aborts the bring-up. mcu_test computes the
+	# general-cmd frame CRC via librtos (same path as --wifi_connect).
 	sleep 1
 	if command -v mcu_test >/dev/null 2>&1; then
-		mcu_test --send-raw=12 >/dev/null 2>&1 || echo "WARNING: mcu op12 (wifi_set_ap_open) failed" >&2
+		mcu_test --wifi_start_ap="$ssid" >/dev/null 2>&1 || echo "WARNING: mcu wifi_start_ap failed" >&2
 	fi
 
 	echo "Assign $ATBM_AP_IP/24 to $IFACE (firmware owns .1 gateway+DHCP)"
@@ -298,6 +301,7 @@ start_atbm_softap() {
 }
 
 stop_atbm_softap() {
+	command -v mcu_test >/dev/null 2>&1 && mcu_test --wifi_stop_ap >/dev/null 2>&1
 	start-stop-daemon -K -q -x /usr/bin/uhttpd 2>/dev/null
 	ip addr flush dev $IFACE 2>/dev/null
 	ip link set $IFACE down 2>/dev/null
