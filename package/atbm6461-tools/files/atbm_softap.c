@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
 
 #define ATBM_WIFI_MODE      0x80017907u
 #define ATBM_AP_CFG         0x80047908u
@@ -28,6 +30,20 @@ struct wsm_join {                 /* 108 bytes, matches driver wsm.h */
     uint8_t keyMgmt; uint8_t keyLength; uint8_t keyId; uint8_t reserved; uint8_t key[64];
 };
 struct wsm_ap_cfg_req { uint32_t status; struct wsm_join join; };  /* 112 bytes */
+
+/* The core silently rejects the whole AP_CFG (no ssid, no beacon) if the BSSID is
+ * zero. Use wlan0's own MAC as the AP BSSID. (Live-proven root cause 2026-08-03.) */
+static int get_mac(const char *ifn, uint8_t mac[6]) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct ifreq ifr; memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifn, IFNAMSIZ - 1);
+    int r = ioctl(s, SIOCGIFHWADDR, &ifr);
+    close(s);
+    if (r < 0) return -1;
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -48,6 +64,9 @@ int main(int argc, char **argv)
     struct wsm_ap_cfg_req req; memset(&req, 0, sizeof(req));
     size_t sl = strlen(ssid); if (sl > 32) sl = 32;
     req.join.ssidLength = (uint8_t)sl; memcpy(req.join.ssid, ssid, sl);
+    { uint8_t mac[6] = {0};
+      if (get_mac("wlan0", mac) == 0) memcpy(req.join.bssid, mac, 6);
+      else fprintf(stderr, "warning: could not read wlan0 MAC for AP BSSID\n"); }
     if (pass) {
         req.join.keyMgmt = KEY_MGMT_WPA2;
         size_t pl = strlen(pass); if (pl > 64) pl = 64;
@@ -56,7 +75,10 @@ int main(int argc, char **argv)
         req.join.keyMgmt = KEY_MGMT_NONE;
     }
     int rc = ioctl(fd, ATBM_AP_CFG, &req);
-    printf("AP_CFG(ssid=%s chan=%d %s) rc=%d\n", ssid, chan, pass ? "wpa2" : "open", rc);
+    printf("AP_CFG(ssid=%s chan=%d %s bssid=%02x:%02x:%02x:%02x:%02x:%02x) rc=%d\n",
+           ssid, chan, pass ? "wpa2" : "open",
+           req.join.bssid[0], req.join.bssid[1], req.join.bssid[2],
+           req.join.bssid[3], req.join.bssid[4], req.join.bssid[5], rc);
     close(fd);
     return rc ? 1 : 0;
 }

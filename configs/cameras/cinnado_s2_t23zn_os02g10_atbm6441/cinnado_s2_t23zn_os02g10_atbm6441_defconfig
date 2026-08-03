@@ -46,6 +46,7 @@ BR2_PACKAGE_THINGINO_WPA_SUPPLICANT_WEXT=y
 # usable). NOTE: a bigger rootfs changes the U-Boot-compiled mtdparts -> needs a full flash (incl
 # U-Boot), not an au_os incremental update.
 BR2_PACKAGE_ZEROTIER_ONE=y
+BR2_THINGINO_LIBSTDCPP=y
 BR2_SENSOR_1_NAME="os02g10"
 BR2_INGENIC_SOC_MODEL="t23zn"
 BR2_THINGINO_AUDIO=y

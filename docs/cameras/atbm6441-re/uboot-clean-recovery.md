@@ -122,13 +122,24 @@ jz_sfc:320k(boot),64k(env),1408k(kernel),4608k(rootfs),9984k(data),16384k@0(all)
 = **exactly the `data` partition (mtd4)**, touching nothing else. Factory-reset offsets
 are **provably correct for this build**.
 
-### ⚠ Offset fragility (must re-check on any rebuild)
-The `data` offset is *computed* from the kernel+rootfs sizes at build time, but the
-`overlay_wipe` offsets are *hardcoded*. They line up only because this build's
-`uImage`=1411528 B (→ aligned 0x160000) and `rootfs.squashfs`=4665344 B (→ aligned
-0x480000) place `data` at exactly `0x640000`. **If a future rebuild changes those sizes,
-`data` moves and the hardcoded `overlay_wipe` would erase the wrong region** — re-verify
-`mtdparts` (data offset) after any kernel/rootfs change and update `overlay_wipe` to match.
+### ⚠→✅ Offset fragility — RESOLVED 2026-08-04
+The `data` offset is *computed* from kernel+rootfs sizes at build time, but `overlay_wipe`
+USED to *hardcode* `0x640000` — and this fragility bit us exactly as warned: the 2026-08-03
+BSSID-fix rebuild grew the rootfs (4608k→8192k) and `au_relayout` moved `data` to
+`0xa60000`, so the hardcoded wipe erased **rootfs** (brick risk) and missed the real
+overlay → the RST factory reset left WiFi stuck in **client** mode. Worse, on this device
+`overlay_wipe` wasn't even imported into the env, so `run overlay_wipe` was a no-op.
+**FIX (live-validated 2026-08-04):** `overlay_wipe` now uses the layout-tracking env vars
+`${data_addr}`/`${data_size}` (set by `au_relayout`), so it always targets the real `data`
+partition regardless of size — no hardcoded offset to go stale. Captured live: `AU:wiping-overlay
+0xa60000 0x5a0000` → `AU:overlay-wiped-defaults` → reboot → AP (`THINGINO-78ec`). The
+~5.76 MB erase completes in ~30s, inside the ~60s MCU host-alive window. **Fully-robust
+alternative** (only needed if `data` ever exceeds ~10 MB so the erase can't finish in one
+window): don't erase from U-Boot at all — have `atbm_rst_recovery_check` tag the kernel
+cmdline (`thingino_factory_reset=1`, RAM-only so it self-clears), and have `overlay/init`
+`flash_eraseall` the mtd **named** "data" (from `/proc/mtd`) before mounting it — offset-free,
+uncuttable (Linux keeps the MCU fed). Also guard `S38 credentials_from_card()` on that tag
+so an inserted provisioning SD can't re-seed client mode on the reset boot.
 
 ### ⚠ 60 s host-alive window (best-effort wipe)
 A full `data` erase is ~57 s (≈179 KB/s) and the ATBM host-alive timer (~60 s, **cannot be

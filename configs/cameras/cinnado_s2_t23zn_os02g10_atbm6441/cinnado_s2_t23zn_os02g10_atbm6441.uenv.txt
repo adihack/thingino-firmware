@@ -45,13 +45,17 @@ au_c6=if fatsize mmc 0:1 au6.done; then echo "AU: au6 done"; else setenv co 0x56
 # kernel 0x60000..0x1C0000 + rootfs 0x1C0000..0x640000 = 0x60000..0x640000 (5.875 MB)
 au_os=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-os.done; then echo "AU: os already applied"; else if fatsize mmc 0:1 autoupdate-os.bin; then setenv aufile autoupdate-os.bin; run au_c1; run au_c2; run au_c3; run au_c4; run au_c5; run au_c6; fatwrite mmc 0:1 ${loadaddr} autoupdate-os.done 1; echo "AU: OS update complete"; fi; fi; fi
 
-# Overlay/config wipe, chunked (data = 0x640000 + 0x9C0000 = 9.75 MB; a single erase
-# would blow past the 60s window). Manual: 'run overlay_wipe'.
-# HONEST CAVEAT: 3 x 3.25 MB is ~57s of erase, so this only completes if the interleaved
-# 'atbm wdt off' really re-feeds the host-alive timer - which is NOT yet verified. The
-# RELIABLE way to wipe the overlay is from Linux ('flash_erase /dev/mtd4 0 0'), because a
-# running Linux keeps the MCU fed indefinitely. Treat this as best-effort.
-overlay_wipe=atbm wdt off; sf probe; sf erase 0x640000 0x340000; atbm wdt off; sf erase 0x980000 0x340000; atbm wdt off; sf erase 0xcc0000 0x340000; echo "overlay wiped"; reset
+# Overlay/config wipe = the RST-hold factory reset action (board_late_init runs
+# 'run overlay_wipe' on a 10s RST hold). Erases the WHOLE 'data' partition using the
+# LAYOUT-TRACKING env vars ${data_addr}/${data_size} (set by au_relayout), NOT hardcoded
+# offsets. The old hardcoded 0x640000 went STALE once the rootfs grew (au_relayout moved
+# 'data' 0x640000 -> 0xa60000), so it erased ROOTFS (brick risk) and missed the real
+# overlay -> reset left WiFi in client mode. LIVE-VALIDATED 2026-08-04: the ~5.76 MB erase
+# completes in ~30s, well inside the ~60s MCU host-alive window, and the cam boots AP.
+# (If a future build ever makes 'data' >~10 MB, this single erase could exceed the window;
+# the fully-robust alternative is a Linux-side by-name wipe - see docs uboot-clean-recovery.md.)
+# Manual: 'run overlay_wipe'.
+overlay_wipe=atbm wdt off; sf probe; echo AU:wiping-overlay ${data_addr} ${data_size}; sf erase ${data_addr} ${data_size}; echo AU:overlay-wiped-defaults; reset
 
 # BENCH ONLY - writes the bootloader, so an interruption needs a CH341A. Never put
 # 'autoupdate-full.bin' on a field card and never add this to 'autoupdate'.

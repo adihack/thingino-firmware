@@ -5,6 +5,7 @@ config BR2_PACKAGE_ZEROTIER_ONE
 	depends on BR2_TOOLCHAIN_HAS_THREADS
 	select BR2_PACKAGE_LIBMINIUPNPC
 	select BR2_PACKAGE_LIBNATPMP
+	select BR2_THINGINO_LIBSTDCPP
 	help
 	  ZeroTier One lets you join ZeroTier virtual networks and have
 	  them appear as tun/tap ports on your system.

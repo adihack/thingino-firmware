@@ -149,6 +149,9 @@ configure() {
 	@if WIFI_ATBM6461@
 	# ATBM6461 uses mcu_test for WiFi connection via MCU, not wpa_supplicant.
 	# Store plain text credentials for mcu_test to read at boot.
+	# Strip CR/LF/tab from BOTH ssid and password: an SD-card uenv.txt saved on Windows has
+	# trailing \r, which otherwise gets written into the SSID verbatim -> silent join failure.
+	ssid=$(printf '%s' "$ssid" | tr -d '\r\n\t')
 	password=$(printf '%s' "$password" | tr -d '\r\n\t')
 	{
 		echo "# created on $(date +%c)"

@@ -272,20 +272,16 @@ start_atbm_softap() {
 	echo "Waiting for SDIO link to stabilize..."
 	sleep 3
 
+	# AP config goes over the WiFi-core WSM channel via /dev/atbm_ioctl (WSM 0x000D set
+	# mode=AP, then 0x000E ap_cfg), which atbm_softap does. It MUST carry a non-zero BSSID
+	# (wlan0's MAC) or the core silently rejects the whole config (no ssid, no beacon) -
+	# atbm_softap sets that now. Do NOT route AP bring-up through the MCU channel
+	# (mcu_test --wifi_start_ap / msg 0x40 / WSM 0x003A): that is the wrong subsystem, it
+	# never applied the SSID/BSSID, and it only ever "worked" when the core was already AP
+	# (root-caused + fixed live 2026-08-03).
 	echo "Starting ATBM6441 SoftAP '$ssid' ch${ATBM_AP_CHAN}"
 	if ! atbm_softap "$ssid" "$ATBM_AP_CHAN"; then
 		echo "WARNING: atbm_softap failed" >&2
-	fi
-
-	# Start + beacon the AP via the Z7682 MCU. The real trigger is message_mgr msg 0x40
-	# (wifi_start_ap) sent WITH the SSID as payload: the firmware memcpy's it into its AP-cfg
-	# buffer, flips the vif STA->AP and beacons (live-confirmed: the AP becomes visible +
-	# connectable). The previous --send-raw=12 was a non-existent opcode, and --send-raw
-	# carries no payload anyway -> an empty SSID aborts the bring-up. mcu_test computes the
-	# general-cmd frame CRC via librtos (same path as --wifi_connect).
-	sleep 1
-	if command -v mcu_test >/dev/null 2>&1; then
-		mcu_test --wifi_start_ap="$ssid" >/dev/null 2>&1 || echo "WARNING: mcu wifi_start_ap failed" >&2
 	fi
 
 	echo "Assign $ATBM_AP_IP/24 to $IFACE (firmware owns .1 gateway+DHCP)"
@@ -311,6 +307,20 @@ stop_atbm_softap() {
 start() {
 	# Credential from SD card
 	credentials_from_card
+
+	# Re-derive the wireless mode AFTER credentials_from_card. The top-level mode= (L43-54)
+	# was computed from the pre-seed $CONFIG; if the SD card just wrote STA creds (mode=client)
+	# an SD-seeded fresh flash would otherwise boot into portal/AP and only join on a 2nd boot.
+	# (STA and AP netdev are both wlan0 on this cam, so IFACE does not need re-deriving.)
+	if ! grep -q 'ssid=' $CONFIG; then
+		mode="portal"
+	elif ! grep -q 'psk=' $CONFIG; then
+		mode="portal"
+	elif grep -q 'mode=2' $CONFIG; then
+		mode="ap"
+	else
+		mode="client"
+	fi
 
 	echo -c 15 "Starting WPA Supplicant"
 

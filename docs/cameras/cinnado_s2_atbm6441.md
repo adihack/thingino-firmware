@@ -792,13 +792,22 @@ live SDIO traffic (PB8 is an MSC1 pin) and had nothing to do with the button. [L
    And a warm reboot leaves the MCU/WSM in a state where WSM startup can hang
    (`mdelay wait wsm_startup_done`) — **module changes need a COLD power cycle**. [LIVE]
 6. **Do not `rmmod` the atbm driver** — it hangs in D-state. [LIVE]
-7. **SoftAP needs BOTH planes; the beacon-start is an MCU command.** [CORRECTED 2026-07-31 — see
-   §4.3] Configure the SSID/channel over the WiFi-core (`atbm_softap`: WSM `0x000D`
-   set_wifimode=AP → `0x000E` ap_cfg, in that order — `0x000E` without `0x000D` hangs), THEN
-   start the beacon over the MCU with `mcu_test --wifi_start_ap="<ssid>"` (msg `0x40`, **SSID as
-   payload**). The earlier "route AP through MCU opcode 12" advice was wrong twice over: opcode 12
-   doesn't exist, and a payload-less send leaves the SSID empty (aborts the bring-up). The
-   resident firmware *is* the hostapd — do not run upstream hostapd. [LIVE]
+7. **SoftAP is ENTIRELY WiFi-core (WSM); the MCU plane is NOT involved and must NOT be used.**
+   [CORRECTED + E2E-VALIDATED 2026-08-03 — supersedes all earlier versions] Bring the AP up with
+   `atbm_softap` over `/dev/atbm_ioctl`, in order: `ATBM_CLEAR_WIFI_CFG` → `ATBM_WIFI_MODE=AP`
+   (WSM `0x000D`, arg=1) → `ATBM_SET_COUNTRY` → `ATBM_WIFI_CHANNEL` → `ATBM_AP_CFG` (WSM `0x000E`,
+   `struct wsm_ap_cfg_req{u32 status; struct wsm_join}`). **The AP_CFG MUST carry a NON-ZERO BSSID
+   = wlan0's own MAC (`join.bssid`, via SIOCGIFHWADDR); with a zero BSSID the core SILENTLY REJECTS
+   the ENTIRE config — no SSID applied, no beacon, yet every ioctl returns rc=0.** This single
+   bug (stock `atbm_softap.c` left `join.bssid`=0) was the whole "no AP / can't set up from phone"
+   symptom. **Do NOT also call `mcu_test --wifi_start_ap` (msg `0x40` / WSM `0x003A` = MCU channel,
+   WRONG SUBSYSTEM): it never applies the SSID/BSSID AND, run after `atbm_softap`, it DISRUPTS the
+   beacon the WSM path just set up (proven: with it = no beacon; removed = beacons).** The earlier
+   "beacon-start is an MCU command / msg 0x40 with SSID payload" advice was WRONG (it only ever
+   appeared to work when the core was already AP). Fix shipped in `package/atbm6461-tools/files/
+   atbm_softap.c` (+bssid) and `package/wifi/files/S38wpa_supplicant.in` (dropped the mcu_test call);
+   validated live: reboot → AP auto-beacons → client gets .200 → portal .2 = HTTP 200. The resident
+   firmware *is* the hostapd — do not run upstream hostapd. [LIVE]
 8. **Autoboot is only ~2 s** (`Hit any key to stop autoboot: 1` → `0`) — a serial catcher must
    trigger on the boot banner, not on a wall-clock guess. [LIVE]
 
