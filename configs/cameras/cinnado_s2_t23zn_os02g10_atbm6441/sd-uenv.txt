@@ -1,0 +1,1 @@
+overlay_wipe=atbm wdt off; sf probe; echo AU:wiping-overlay ${data_addr} ${data_size}; sf erase ${data_addr} ${data_size}; echo AU:overlay-wiped-defaults; reset

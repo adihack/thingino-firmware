@@ -55,6 +55,12 @@ au_os=if test "${enable_updates}" = "true"; then if fatsize mmc 0:1 autoupdate-o
 # (If a future build ever makes 'data' >~10 MB, this single erase could exceed the window;
 # the fully-robust alternative is a Linux-side by-name wipe - see docs uboot-clean-recovery.md.)
 # Manual: 'run overlay_wipe'.
+# DELIVERY (CONFIRMED 2026-08-04): au_os never rewrites the env partition (chunks start at
+# 0x60000), so an au_os-flashed unit keeps its OLD overlay_wipe. To push this corrected line
+# onto such units, drop the MINIMAL companion file 'sd-uenv.txt' (this line only) on the
+# flashing SD renamed to 'uenv.txt' - loaduenv imports it on boot. KEEP sd-uenv.txt IN SYNC
+# with this line. Do NOT ship this whole file as the SD uenv.txt (its au_cN below are stale
+# vs deployed au_c1..au_c16). See docs/cameras/atbm6441-re/uboot-clean-recovery.md.
 overlay_wipe=atbm wdt off; sf probe; echo AU:wiping-overlay ${data_addr} ${data_size}; sf erase ${data_addr} ${data_size}; echo AU:overlay-wiped-defaults; reset
 
 # BENCH ONLY - writes the bootloader, so an interruption needs a CH341A. Never put

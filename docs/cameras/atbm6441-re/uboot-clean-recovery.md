@@ -141,6 +141,35 @@ cmdline (`thingino_factory_reset=1`, RAM-only so it self-clears), and have `over
 uncuttable (Linux keeps the MCU fed). Also guard `S38 credentials_from_card()` on that tag
 so an inserted provisioning SD can't re-seed client mode on the reset boot.
 
+### ✅ DELIVERY: get the corrected env onto a device — CONFIRMED 2026-08-04
+`overlay_wipe` reaches a device's U-Boot env via `loaduenv` importing a **`uenv.txt` from the
+flashing SD** (`env import -t -r` + `saveenv` + writes `uenv.done`), OR from the compiled
+default env (built from `configs/.../*.uenv.txt`) when the env partition is blank (a true
+CH341A full-chip flash). The `autoupdate-os.bin`-only SD used for field flashing carries NO
+`uenv.txt`, and `au_os` never writes the env partition (chunks start at `0x60000`), so an
+au_os-flashed unit keeps its OLD env — which is exactly why this unit's env had **no
+`overlay_wipe` at all** (`run overlay_wipe` was a silent no-op).
+
+**CONFIRMED 2026-08-04 — validated live on a full 16-chunk fresh flash + relayout.** Dropped a
+minimal `uenv.txt` (just `overlay_wipe`, with a distinctive `(uenv)` echo tag) on the SD.
+Serial captured the whole boot: all 16 chunks flashed → `AU: RELAYOUT COMPLETE` → **`167
+bytes read` → `UENV: importing uenv.txt` → `UENV: env saved`**. `loaduenv` is wired into
+`bootcmd` (`run autoupdate; run loaduenv; …`) so it runs right after `au_relayout`. Post-boot
+`fw_printenv overlay_wipe` carried the `(uenv)` tag (proof it came from the card) and targeted
+`data_addr=0xa60000 data_size=0x5a0000`. So **dropping a `uenv.txt` on the flashing SD is the
+supported way to push the corrected `overlay_wipe` onto au_os-flashed / already-deployed
+units** (the bench device was then reset to the clean, tag-free `overlay_wipe`).
+
+**SHIP:** put a **clean** minimal `uenv.txt` (no test tag — just
+`overlay_wipe=atbm wdt off; sf probe; echo AU:wiping-overlay ${data_addr} ${data_size}; sf erase ${data_addr} ${data_size}; echo AU:overlay-wiped-defaults; reset`)
+alongside `autoupdate-os.bin` on every flashing SD. Keep it MINIMAL — overlay_wipe only.
+
+**FLAG — build uenv is STALE vs deployed:** the committed `configs/cameras/cinnado_s2_.../
+*.uenv.txt` still has `au_c1..au_c6` while shipped units run `au_c1..au_c16` + `au_relayout`
+(data @ `0xa60000`). Importing the *whole* build uenv onto a deployed device would REGRESS
+`au_os` — that is why the SD `uenv.txt` MUST stay minimal (overlay_wipe only). Reconcile the
+build uenv to the deployed 16-chunk/relayout env before ever shipping a full uenv.
+
 ### ⚠ 60 s host-alive window (best-effort wipe)
 A full `data` erase is ~57 s (≈179 KB/s) and the ATBM host-alive timer (~60 s, **cannot be
 disabled, only fed**, and U-Boot doesn't feed it) may cut it. This is *acceptable* for a
