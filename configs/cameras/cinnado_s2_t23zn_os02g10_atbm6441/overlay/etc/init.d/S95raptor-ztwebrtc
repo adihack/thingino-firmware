@@ -1,0 +1,48 @@
+#!/bin/sh
+# S95raptor-ztwebrtc -- make Raptor WebRTC reachable over ZeroTier.
+#
+# rwd builds its WebRTC ICE candidate from [webrtc] local_ip. When that is
+# empty (the build default) it auto-detects the LAN interface IP (e.g.
+# 192.168.x.x), which a client reaching the camera over ZeroTier cannot route
+# to -> the browser's WebRTC handshake fails ("Connection failed") even though
+# RTSP (which just dials the IP you type) works fine.
+#
+# This sets local_ip to the camera's own ZeroTier IP so rwd advertises an
+# address ZeroTier clients can actually reach. It is a no-op when raptor or a
+# ZeroTier interface is absent, so it is safe on non-ZeroTier / non-raptor
+# builds. Runs after S90zerotier. The value is persisted to raptor.conf, so on
+# normal boots rwd already starts correct; this only re-applies after a config
+# wipe / reflash (overlay erase) or if the ZeroTier IP ever changes.
+#
+# Backgrounded so a not-yet-authorized ZeroTier link never stalls boot.
+
+RAPTORCTL=/usr/bin/raptorctl
+[ -x "$RAPTORCTL" ] || exit 0
+
+zt_ip() { ip -o -4 addr show 2>/dev/null | awk '$2 ~ /^zt/ {split($4,a,"/"); print a[1]; exit}'; }
+
+apply() {
+	# Wait up to ~60s for the ZeroTier interface to obtain its address.
+	i=0; IP=""
+	while [ "$i" -lt 60 ]; do
+		IP=$(zt_ip); [ -n "$IP" ] && break
+		sleep 1; i=$((i + 1))
+	done
+	[ -n "$IP" ] || { echo "raptor-ztwebrtc: no ZeroTier IP; webrtc local_ip left as-is" >&2; return; }
+
+	CUR=$("$RAPTORCTL" config get webrtc local_ip 2>/dev/null | tr -d '\r\n ')
+	if [ "$CUR" != "$IP" ]; then
+		echo "raptor-ztwebrtc: webrtc local_ip '$CUR' -> $IP"
+		"$RAPTORCTL" config set webrtc local_ip "$IP" 2>/dev/null
+		"$RAPTORCTL" config save 2>/dev/null
+		"$RAPTORCTL" rwd restart 2>/dev/null
+	fi
+}
+
+case "$1" in
+	start) apply & ;;
+	stop) : ;;
+	restart) apply & ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0
