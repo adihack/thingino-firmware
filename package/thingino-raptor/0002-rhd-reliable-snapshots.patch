@@ -1,0 +1,165 @@
+From: Adrian Soltys <adriansoltys@gmail.com>
+Subject: [PATCH] rhd: serve /snap.jpg reliably (reopen idle ring, newest
+ readable frame, route /snap_sub)
+
+The HTTP snapshot endpoint returned 404 or 503 on essentially every request:
+
+- 404: the main loop closes a JPEG ring handle after ~20s idle
+  ("jpeg ring idle, closing") and only reopens it on the periodic ~2s
+  reconnect tick. A /snap request arriving in that window hit a NULL
+  jpeg_rings[si] and 404'd, never even waking the on-demand encoder.
+
+- 503: handle_snapshot() initialised its read cursor to write_seq and read
+  forward with no RSS_EOVERFLOW recovery. Per the ring contract a frame is
+  readable only while its seq < write_seq, so the newest *readable* frame is
+  write_seq-1; a cursor pinned to write_seq can never read a resident frame.
+  Combined with the on-demand ~1 fps encoder's warm-up exceeding the fixed 2s
+  budget, every request fell through to "No snapshot available yet".
+
+- /snap_sub.jpg served the main ring: the router matched the "/snap" prefix
+  and stream selection only honoured ?stream=N, ignoring the _sub suffix.
+
+Fix:
+- rhd_ensure_jpeg_ring(): (re)open jpeg_rings[si] on demand from the /snap
+  handler, so a snapshot can wake a ring the idle logic has closed.
+- handle_snapshot(): read the newest readable frame (write_seq-1) once a
+  post-acquire frame exists (write_seq >= baseline+2), using the same
+  RSS_EOVERFLOW step-back the MJPEG reader uses; derive the (bounded) wait
+  budget from the ring's frame rate.
+- route /snap_sub.jpg (and any _sub path) to stream 1 unless ?stream= is set.
+
+Fixes snapshots for the web UI, ONVIF, and Home Assistant generic cameras.
+
+Known follow-up: handle_snapshot() still waits inline on the single-threaded
+epoll loop; a later change should serve it from the main-loop frame pump so a
+snapshot never stalls concurrent MJPEG/audio clients.
+---
+diff --git a/rhd/rhd_main.c b/rhd/rhd_main.c
+index 800ae02..45421b7 100644
+--- a/rhd/rhd_main.c
++++ b/rhd/rhd_main.c
+@@ -33,6 +33,43 @@ static int index_html_len;
+ 
+ /* Base64 and HTTP auth moved to raptor-common (rss_http.h) */
+ 
++/*
++ * Ensure jpeg_rings[si] is open, (re)opening it on demand.
++ *
++ * The main loop closes a JPEG ring handle after it has been idle for ~20s
++ * (see server_run: "jpeg ring idle, closing") and only reopens it on the
++ * periodic ~2s reconnect tick. A snapshot request that lands in that window
++ * would otherwise 404 even though the stream exists, so let it reopen the
++ * ring itself. Returns the ring, or NULL if it cannot be opened.
++ */
++static rss_ring_t *rhd_ensure_jpeg_ring(rhd_server_t *srv, int si)
++{
++	static const char *const names[RHD_MAX_JPEG] = {
++		"jpeg0", "jpeg1", "s1_jpeg0", "s1_jpeg1", "s2_jpeg0", "s2_jpeg1"
++	};
++	if (si < 0 || si >= RHD_MAX_JPEG)
++		return NULL;
++	if (srv->jpeg_rings[si])
++		return srv->jpeg_rings[si];
++
++	rss_ring_t *ring = rss_ring_open(names[si]);
++	if (!ring)
++		return NULL;
++	rss_ring_check_version(ring, names[si]);
++	srv->jpeg_rings[si] = ring;
++	if (si + 1 > srv->jpeg_ring_count)
++		srv->jpeg_ring_count = si + 1;
++
++	/* Make sure the shared snapshot buffer can hold this ring's frames. */
++	uint32_t mfs = rss_ring_max_frame_size(ring);
++	if (mfs > srv->snap_buf_size) {
++		free(srv->snap_buf);
++		srv->snap_buf = malloc(mfs);
++		srv->snap_buf_size = srv->snap_buf ? mfs : 0;
++	}
++	return ring;
++}
++
+ /* ── Snapshot handler — serve latest JPEG from ring ── */
+ 
+ /*
+@@ -61,20 +98,53 @@ static bool handle_snapshot(rhd_server_t *srv, rhd_client_t *c, int epoll_fd, rs
+ 	/* Signal demand so the JPEG encoder starts if idle */
+ 	rss_ring_acquire(ring);
+ 
+-	/* Skip stale frames — start past current write_seq so we only
+-	 * get a frame produced AFTER the acquire woke the encoder.
+-	 * JPEG may be 1 fps, so allow up to 2s for the first frame. */
++	/* JPEG is encoded on-demand: while no consumer holds a reference the
++	 * encoder is stopped, so write_seq is frozen at the frame captured by
++	 * the PREVIOUS snapshot. Record that as a baseline, wait for the
++	 * encoder (just woken by our acquire) to publish genuinely new frames,
++	 * then return the newest readable one.
++	 *
++	 * Ring contract: rss_ring_read() only returns a frame whose seq is
++	 * strictly less than write_seq (see rss_ring.c: "if (*read_seq >= wseq)
++	 * return -EAGAIN"), so the newest *readable* frame is write_seq-1 — a
++	 * just-published frame (seq == write_seq) is not readable until the next
++	 * publish. A frame is therefore known-fresh once write_seq reaches
++	 * baseline+2 (=> write_seq-1 >= baseline+1, i.e. produced after acquire).
++	 * This mirrors how the /mjpeg reader consumes write_seq-1; the old code
++	 * pinned the cursor to write_seq, which the contract can never satisfy,
++	 * so it always fell through to the 503 below. */
+ 	const rss_ring_header_t *hdr = rss_ring_get_header(ring);
+-	uint64_t seq = atomic_load(&hdr->write_seq);
++	uint64_t baseline = atomic_load(&hdr->write_seq);
+ 	uint32_t length = 0;
+ 	rss_ring_slot_t meta;
+ 	int ret = -EAGAIN;
+ 
+-	for (int attempt = 0; attempt < 20; attempt++) {
++	/* On-demand JPEG may run at ~1 fps and needs encoder warm-up before two
++	 * fresh frames are readable. Scale the wait with the ring's frame rate
++	 * but keep it bounded (never worse than the previous ~2s budget at higher
++	 * fps), so this can never hang; a warm ring returns quickly. */
++	uint32_t fps = hdr->fps_num / (hdr->fps_den ? hdr->fps_den : 1);
++	int max_attempts = 30; /* ~3s for <=1 fps + warm-up */
++	if (fps >= 5)
++		max_attempts = 15; /* ~1.5s */
++	if (fps >= 15)
++		max_attempts = 8; /* ~0.8s */
++
++	for (int attempt = 0; attempt < max_attempts; attempt++) {
++		uint64_t wseq = atomic_load(&hdr->write_seq);
++		if (wseq >= baseline + 2) {
++			uint64_t seq = wseq - 1; /* newest readable = freshest frame */
++			ret = rss_ring_read(ring, &seq, buf, buf_size, &length, &meta);
++			if (ret == RSS_EOVERFLOW && seq > 0) {
++				/* Producer overtook us mid-read: step back one and
++				 * retry, exactly as the MJPEG reader does. */
++				seq--;
++				ret = rss_ring_read(ring, &seq, buf, buf_size, &length, &meta);
++			}
++			if (ret == 0 && length >= 2 && buf[0] == 0xFF && buf[1] == 0xD8)
++				break;
++		}
+ 		rss_ring_wait(ring, 100);
+-		ret = rss_ring_read(ring, &seq, buf, buf_size, &length, &meta);
+-		if (ret == 0 && length >= 2 && buf[0] == 0xFF && buf[1] == 0xD8)
+-			break;
+ 	}
+ 
+ 	rss_ring_release(ring);
+@@ -325,9 +395,16 @@ static void handle_request(rhd_server_t *srv, rhd_client_t *c)
+ 	}
+ 
+ 	if (strncmp(path, "/snap", 5) == 0) {
++		/* /snap_sub.jpg selects the sub stream unless ?stream= overrides. */
+ 		int si = parse_stream_param(path);
+-		if (si < srv->jpeg_ring_count && srv->jpeg_rings[si]) {
+-			if (handle_snapshot(srv, c, srv->epoll_fd, srv->jpeg_rings[si],
++		if (!strstr(path, "stream=") && strstr(path, "_sub"))
++			si = 1;
++		/* Reopen the ring on demand: the main loop closes idle jpeg rings,
++		 * and a snapshot must be able to reopen one itself (otherwise it
++		 * would 404 in the window before the periodic reconnect tick). */
++		rss_ring_t *ring = rhd_ensure_jpeg_ring(srv, si);
++		if (ring && srv->snap_buf) {
++			if (handle_snapshot(srv, c, srv->epoll_fd, ring,
+ 					    srv->snap_buf, srv->snap_buf_size))
+ 				return; /* keep alive — async send in progress */
+ 		} else {
